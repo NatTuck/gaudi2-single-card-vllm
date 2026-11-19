@@ -101,11 +101,13 @@ def test_lightx2v_544p_canvas_is_ref2va_only():
 
 def test_lightx2v_canvas_patch_keeps_shared_base_preprocessing_strict():
     install_minimax_h3_patches()
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
-    from vllm_omni.model_executor.models.minimax_h3 import preprocessing
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing, preprocessing
 
-    assert pipeline_minimax_h3._resolve_output_canvas(16 / 9, 544) == (544, 960)
-    with pytest.raises(ValueError, match="must be 768"):
+    # The request path accepts the published 544p Ref2V canvas...
+    assert encoder_processing.resolve_minimax_h3_output_canvas(16 / 9, 544) == (544, 960)
+    # ...while the shared helper stays strict for every other short edge.
+    with pytest.raises(OmniClientError, match="must be 768"):
         preprocessing.resolve_minimax_h3_output_canvas(16 / 9, 544)
 
 

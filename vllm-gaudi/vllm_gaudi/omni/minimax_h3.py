@@ -440,14 +440,20 @@ def _install_h3_modulation_ops() -> None:
     """Replace H3's CUDA-Triton modulation bindings with HPU operators."""
 
     from vllm_gaudi.omni import minimax_h3_ops as hpu_ops
-    from vllm_omni.diffusion.attention.ops import minimax_h3_modulation
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer
+
+    # The helpers moved out of ``diffusion.attention.ops.minimax_h3_modulation`` (removed) into
+    # ``diffusion.layers.indexed_modulation``; keep working with either location.
+    try:
+        from vllm_omni.diffusion.layers import indexed_modulation as modulation_module
+    except ImportError:
+        from vllm_omni.diffusion.attention.ops import minimax_h3_modulation as modulation_module
 
     for name in hpu_ops.__all__:
         implementation = getattr(hpu_ops, name)
         # The Transformer imports these functions by name, so replace both
         # the source module and its already-bound globals.
-        setattr(minimax_h3_modulation, name, implementation)
+        setattr(modulation_module, name, implementation)
         setattr(minimax_h3_transformer, name, implementation)
 
 
@@ -567,33 +573,24 @@ def _validate_h3_output_short_edge(partition: str, task: str, short_edge: object
 
 
 def _install_h3_ref2va_canvas_hook() -> None:
-    """Allow the official LightX2V Ref2V 544p profile in pinned Omni."""
+    """Allow the official LightX2V Ref2V 544p profile in vLLM-Omni.
 
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline
+    The request canvas is resolved in ``encoder_processing.resolve_minimax_h3_shape``, which calls
+    ``preprocessing.resolve_minimax_h3_output_canvas`` through an imported binding. Only that
+    binding is replaced: the shared helper keeps rejecting any short edge other than its own, so
+    the strictness the rest of the stack relies on is unchanged.
+    """
 
-    original_canvas = pipeline._resolve_output_canvas
-    original_resolve_shape = pipeline.MiniMaxH3Pipeline._resolve_shape
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing
+
+    original_canvas = encoder_processing.resolve_minimax_h3_output_canvas
 
     def resolve_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, int]:
         if short_edge == _LIGHTX2V_REF_OUTPUT_SHORT_EDGE:
             return _lightx2v_ref_output_canvas(aspect_ratio)
         return original_canvas(aspect_ratio, short_edge)
 
-    def resolve_shape(
-        self: nn.Module,
-        task: str,
-        sampling: Any,
-        image: Any | None,
-    ) -> tuple[int, int, int, int, int]:
-        extra = sampling.extra_args or {}
-        target = extra.get("target")
-        target = target if isinstance(target, Mapping) else {}
-        short_edge = target.get("short_edge", extra.get("short_edge", _H3_BASE_OUTPUT_SHORT_EDGE))
-        _validate_h3_output_short_edge(str(self.partition), task, short_edge)
-        return original_resolve_shape(self, task, sampling, image)
-
-    pipeline._resolve_output_canvas = resolve_output_canvas
-    pipeline.MiniMaxH3Pipeline._resolve_shape = resolve_shape
+    encoder_processing.resolve_minimax_h3_output_canvas = resolve_output_canvas
     logger.info_once("Enabled MiniMax H3 Ref2VA 544p canvas support for the LightX2V four-step profile")
 
 
@@ -1418,9 +1415,12 @@ def install_minimax_h3_patches() -> None:
         self: nn.Module,
         od_config: object,
         quant_config: object | None = None,
+        **kwargs: object,
     ) -> None:
         quant_config = _map_h3_dit_quant_config(quant_config)
-        original_dit_init(self, od_config, quant_config)
+        # Later revisions pass extra keyword-only arguments (diffusers_weights, attention_cls);
+        # forward them so the patch keeps working as upstream grows the constructor.
+        original_dit_init(self, od_config, quant_config, **kwargs)
         self._vllm_gaudi_quant_config = quant_config
 
     def encoder_init(
@@ -1473,20 +1473,38 @@ def install_minimax_h3_patches() -> None:
     MiniMaxH3Qwen3VLEncoder.load_weights = _load_minimax_h3_encoder_weights
     MiniMaxH3Qwen3VLRowParallelLinear.weight_loader = _h3_row_parallel_weight_loader
     _install_checkpoint_adapter()
-    _install_h3_modulation_ops()
-    _install_h3_encoder_attention_hooks()
-    _install_h3_ref2va_canvas_hook()
-    _install_h3_reference_video_transcode_hook()
-    _install_fasth3_hooks()
-    _install_h3_layout_and_noise_hooks()
+
     from vllm_gaudi.omni.minimax_h3_vae import install_h3_vae_patches
 
-    install_h3_vae_patches()
-    _install_h3_phase_offload_hooks()
-    _install_h3_trajectory_debug_hook()
-    _install_h3_dit_trace_hook()
+    results: dict[str, str] = {}
+    for name, installer in (
+        ("modulation_ops", _install_h3_modulation_ops),
+        ("encoder_attention", _install_h3_encoder_attention_hooks),
+        ("ref2va_canvas", _install_h3_ref2va_canvas_hook),
+        ("reference_video_transcode", _install_h3_reference_video_transcode_hook),
+        ("fasth3", _install_fasth3_hooks),
+        ("layout_and_noise", _install_h3_layout_and_noise_hooks),
+        ("vae", install_h3_vae_patches),
+        ("phase_offload", _install_h3_phase_offload_hooks),
+        ("trajectory_debug", _install_h3_trajectory_debug_hook),
+        ("dit_trace", _install_h3_dit_trace_hook),
+    ):
+        # Each hook rebinds a different upstream seam. A vLLM-Omni revision that moved one of
+        # them must not take the others down with it, so every installer reports its own state.
+        try:
+            installer()
+            results[name] = "installed"
+        except Exception as error:
+            results[name] = f"skipped: {type(error).__name__}: {error}"
+            logger.warning("MiniMax H3 hook %s does not apply to this vLLM-Omni revision", name, exc_info=True)
+
     _PATCHED = True
-    logger.info_once("Installed MiniMax H3 FP8, FastH3, and HPU operator hooks for Gaudi")
+    installed = [name for name, state in results.items() if state == "installed"]
+    skipped = {name: state for name, state in results.items() if state != "installed"}
+    logger.info("MiniMax H3 hooks installed: %s", ", ".join(installed))
+    if skipped:
+        logger.warning("MiniMax H3 hooks skipped on this vLLM-Omni revision: %s", skipped)
+    return results
 
 
 __all__ = [

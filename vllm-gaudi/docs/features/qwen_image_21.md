@@ -155,9 +155,11 @@ rm -rf .venv032/lib/python3.12/site-packages/{torch,torchgen,torchvision,torchau
 - **No text-length bucketing yet.** The snapshot's worker padded text tokens to 64-token buckets so
   compiled graphs are reused across prompts. The upstream pipeline recompiles per text length: with
   `--compile`, a prompt of a new length costs about 0.5-1.5 s extra on its first request.
-- **MiniMax H3 is not ported to this stack yet.** `install_minimax_h3_patches()` fails on vLLM-Omni
-  v0.32.0 (the modulation ops moved to `diffusion/layers/indexed_modulation.py`, and the VAE/pipeline
-  grew substantially) and is gated so it cannot block image serving. That is the next work item.
+- **MiniMax H3 is ported but not exercised end to end here.** All ten H3 hooks install on vLLM-Omni
+  v0.32.0 and the H3 unit tests pass, but the 0.32 adapter loads the *native* checkpoint layout
+  (`auto_map.AutoModel`), while the snapshot on this host is the diffusers variant. A 5 s T2VA run
+  needs the native ModelScope artifacts; see the H3 guide's
+  [port status](../features/minimax_h3.md#vllm-omni-032-port-status).
 - **One model at a time.** As in the snapshot's README, the diffusion models never share the card
   with the 27B service.
 

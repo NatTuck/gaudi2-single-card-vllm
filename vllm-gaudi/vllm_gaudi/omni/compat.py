@@ -49,12 +49,24 @@ def _install_reexports() -> None:
             setattr(package, name, value)
 
 
-def _install_module_stub(module_name: str, **attributes: object) -> types.ModuleType:
-    """Register a stand-in for a vLLM module that this vLLM does not have."""
+def _install_module_stub(module_name: str, **attributes: object) -> types.ModuleType | None:
+    """Register a stand-in for a vLLM module that this vLLM does not have.
+
+    Returns ``None`` (and touches nothing) when the module is importable, so the stand-in can
+    never shadow a real vLLM module.
+    """
+
+    import importlib
+    import importlib.util
 
     existing = sys.modules.get(module_name)
     if existing is not None:
         return existing
+    try:
+        if importlib.util.find_spec(module_name) is not None:
+            return importlib.import_module(module_name)
+    except (ImportError, ValueError):
+        pass
     module = types.ModuleType(module_name)
     for name, value in attributes.items():
         setattr(module, name, value)

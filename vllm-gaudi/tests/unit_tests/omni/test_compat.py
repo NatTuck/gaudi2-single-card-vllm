@@ -3,28 +3,73 @@
 import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
-
-from vllm.entrypoints.openai.engine.protocol import RequestResponseMetadata
 
 from vllm_gaudi.omni.compat import install_vllm_omni_compat
 from vllm_gaudi.omni import register_omni_platform
 from vllm_gaudi.platform import HpuPlatform
 
 
-def test_request_metadata_import_bridge(monkeypatch):
-    module_names = (
-        "vllm.entrypoints.generate.base.protocol",
-        "vllm.entrypoints.serve.engine.protocol",
-    )
-    for module_name in module_names:
-        monkeypatch.delitem(sys.modules, module_name, raising=False)
+def test_compat_install_is_idempotent():
+    install_vllm_omni_compat()
+    install_vllm_omni_compat()
+
+    # Every bridge is installed by name only when the name is absent, so the second call must
+    # leave the modules untouched.
+    import vllm.distributed as distributed
+
+    assert callable(distributed.get_tp_group)
+
+
+def test_distributed_reexports_match_their_sources():
+    """vLLM-Omni imports these from the package; vLLM only defines them in the submodules."""
 
     install_vllm_omni_compat()
 
-    for module_name in module_names:
-        module = sys.modules[module_name]
-        assert module.RequestResponseMetadata is RequestResponseMetadata
+    import vllm.distributed as distributed
+    from vllm.distributed import communication_op, parallel_state
+
+    for name in (
+            "get_tp_group",
+            "get_pp_group",
+            "get_ep_group",
+            "get_dp_group",
+            "get_tensor_model_parallel_rank",
+            "get_tensor_model_parallel_world_size",
+    ):
+        assert getattr(distributed, name) is getattr(parallel_state, name), name
+
+    for name in ("tensor_model_parallel_all_gather", "tensor_model_parallel_all_reduce"):
+        assert getattr(distributed, name) is getattr(communication_op, name), name
+
+
+def test_compat_does_not_shadow_modules_vllm_provides():
+    """The stand-ins must never replace a real vLLM module, whatever revision is installed."""
+
+    install_vllm_omni_compat()
+
+    import importlib
+    import importlib.util
+
+    if importlib.util.find_spec("vllm.v1.kv_hints") is not None:
+        module = importlib.import_module("vllm.v1.kv_hints")
+        assert not getattr(module, "__file__", "").endswith("<stub>")
+        assert module.__file__ is not None
+
+
+def test_torchaudio_stub_raises_on_use():
+    install_vllm_omni_compat()
+
+    import importlib.util
+
+    if importlib.util.find_spec("torchaudio") is not None:
+        pytest.skip("a real torchaudio is installed")
+
+    import torchaudio
+
+    with pytest.raises(RuntimeError, match="torchaudio is not available"):
+        torchaudio.functional.resample(None, 1, 2)
 
 
 def test_hpu_omni_platform_exposes_cache_eviction(monkeypatch):

@@ -564,3 +564,28 @@ activation row, apply per-output-channel weight scales, and dispatch
 declared precision. The serialized native ModelOpt FP8 path uses the same HPU
 GEMM contract. Host work is limited to tokenization, media preparation, request
 scheduling, and MP4 encoding.
+
+## vLLM-Omni 0.32 port status
+
+This checkout now targets **vLLM v0.32.0 + vLLM-Omni v0.32.0** (see
+[Qwen-Image 2.1](qwen_image_21.md) for the dependency set and the image/video-only scope). The
+H3 hook layer was ported to that revision:
+
+| Hook | State on vLLM-Omni 0.32.0 |
+| --- | --- |
+| modulation ops | re-pointed: the helpers moved from `diffusion/attention/ops/minimax_h3_modulation.py` (removed) to `diffusion/layers/indexed_modulation.py`, same four names |
+| encoder attention / encoder `__init__` / weight mapping | installed unchanged |
+| Ref2VA 544p canvas | re-anchored on `encoder_processing.resolve_minimax_h3_output_canvas` (the pipeline's `_resolve_output_canvas`/`_resolve_shape` no longer exist); the shared preprocessing helper stays strict |
+| reference-video transcode, FastH3, layout/noise, VAE, phase offload, trajectory, DiT trace | installed unchanged |
+| DiT constructor patch | forwards keyword-only arguments (`diffusers_weights`, `attention_cls`) that 0.32 added |
+
+`install_minimax_h3_patches()` now installs each hook independently and reports which ones do not
+apply, so a moved upstream seam cannot take the others down. On vLLM-Omni v0.32.0 all ten install.
+The H3 unit tests in `tests/unit_tests/omni/` pass (96 passed, 1 skipped for the whole suite).
+
+**Not yet exercised end to end:** the vLLM-Omni 0.32 H3 adapter loads the **native**
+checkpoint layout (`auto_map.AutoModel` in each component config), while the snapshot on this host
+(`models--MiniMaxAI--MiniMax-H3`, the diffusers variant) carries `_class_name` configs. The
+qualified native artifacts are the ones [ModelScope-only artifacts](#modelscope-only-artifacts)
+describes, built by `tools/minimax_h3/prepare_*_modelscope.py`. A 5 s T2VA run therefore needs that
+~100 GB download before the timing can be compared with the 100.6 s figure above.
