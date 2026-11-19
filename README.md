@@ -128,6 +128,8 @@ Online FP8 was 11% faster at 1024² but changed image composition (17–26 dB PS
 
 The Omni switches are environment variables and default to off: `VLLM_GAUDI_OMNI_HPU_COMPILE`, `VLLM_GAUDI_OMNI_SDPA_SOFTMAX_MODE`, `VLLM_GAUDI_OMNI_SDPA_KV_ALIGN`, `VLLM_GAUDI_OMNI_SDPA_MAXFREE` (+ `_SKIP_LAYERS`), `VLLM_GAUDI_H3_VAE_SOFTMAX_MODE` and `VLLM_GAUDI_H3_VAE_KV_ALIGN`. The one exception is `VLLM_GAUDI_OMNI_SDPA_KV_ALIGN`, which is on by default (128). The H3 deployment uses `SOFTMAX_MODE=fast`, `PT_HPU_SDPA_HEAD_FACTOR=2`, `HPU_COMPILE=1`, `MAXFREE=1` with layers `45,48,49` skipped, and the VAE in fast mode with alignment 128. The model launchers and the Qwen-Image worker are not part of this repository.
 
+**Qwen-Image 2.1 launcher (added to this checkout).** `vllm-gaudi/tools/qwen_image_2_1/serve_single_hpu.py` leases one idle module and serves Qwen-Image 2.1 through `vllm serve --omni --diffusion-attention-backend HPU_SDPA`, with the real-valued rope patch the Gaudi device needs (the upstream rope is complex, which the device does not support) and the import bridges for the vLLM-Omni revision that carries the model. Measured here on one Gaudi2 at 1024²: **3.87 s** eager and **3.12–3.39 s** with `VLLM_GAUDI_OMNI_HPU_COMPILE=1` for a 4-step request, 8.91 s for 20 steps. Installation, requests and the deviations from the pinned dependency set are in [the Qwen-Image 2.1 guide](vllm-gaudi/docs/features/qwen_image_21.md).
+
 ## What is optimized
 
 - **Stochastic speculative decoding.** A separate DFlash2 FP16 draft model proposes candidates for the Qwen3.8-27B FP8 target, retaining temperature, top-p, and top-k sampling. Target-side MTP layers are optional. Gains depend on draft acceptance and workload content.

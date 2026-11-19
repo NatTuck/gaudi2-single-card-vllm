@@ -143,6 +143,20 @@ setup(
             "modelscope==1.40.0",
             "imageio-ffmpeg==0.6.0",
         ],
+        # Qwen-Image 2.1 needs the first vLLM-Omni revision that carries the model: the H3
+        # baseline above predates it and its diffusion registry has no QwenImage21Pipeline.
+        # transformers 5.16.1 is what diffusers 0.40.0 actually needs (it imports HybridCache,
+        # absent in 5.14.1) and still satisfies vLLM's transformers<5.18 bound. Install this
+        # extra *instead of* ``omni``; see docs/features/qwen_image_21.md.
+        "omni-qwen-image21": [
+            "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@3dc35694b3d458fc1461a8fe71832ac12e8c8cea",
+            "transformers==5.16.1",
+            "tokenizers>=0.23.1,<0.24",
+            "diffusers==0.40.0",
+            "imageio[ffmpeg]>=2.37.2",
+            "accelerate==1.12.0",
+            "modelscope==1.40.0",
+        ],
     },
     entry_points={
         "vllm.platform_plugins": ["hpu = vllm_gaudi:register"],
