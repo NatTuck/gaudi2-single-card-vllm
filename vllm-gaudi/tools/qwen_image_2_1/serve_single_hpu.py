@@ -134,9 +134,9 @@ def _command(args: argparse.Namespace, model: Path) -> list[str]:
         str(args.max_num_seqs),
         "--diffusion-attention-backend",
         "HPU_SDPA",
-        # vLLM-Omni compiles repeated blocks with inductor unless told otherwise; the HPU Omni
-        # platform reports no inductor support, and the regional compile below is the Gaudi path.
-        "--enforce-eager",
+        # Compiled execution only: the HPU Omni platform reports no inductor support and forces
+        # CompilationMode.NONE, and VLLM_GAUDI_OMNI_HPU_COMPILE compiles the DiT blocks. Eager
+        # execution is a reference point, never a deployment mode.
     ]
     if args.vae_use_tiling:
         command.append("--vae-use-tiling")

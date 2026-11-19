@@ -352,7 +352,6 @@ def _command(args: argparse.Namespace, model: Path, task_type: str) -> list[str]
         "1",
         "--kv-cache-memory-bytes",
         str(args.kv_cache_memory_bytes),
-        "--enforce-eager",
         "--diffusion-offload-config",
         json.dumps(offload, separators=(",", ":")),
         "--diffusion-attention-backend",
