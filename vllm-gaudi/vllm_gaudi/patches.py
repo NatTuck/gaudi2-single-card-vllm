@@ -101,11 +101,39 @@ Currently:
 
 import gc
 import inspect
+import logging
+import os
 from typing import Callable, Optional
 
 import torch
 
 from vllm import envs
+
+logger = logging.getLogger(__name__)
+
+
+def _diffusion_only_scope() -> bool:
+    """Whether this process serves diffusion models only (image/video).
+
+    The deferred patches below target LLM runtime internals (sampler, logprobs, Mamba/GDN
+    state, KV-cache blocks, prefix state cache). They move between vLLM releases, and a
+    diffusion-only deployment does not use any of them, so one that no longer applies must not
+    abort the server. The omni launcher sets ``VLLM_GAUDI_SCOPE=omni``; without it the behaviour
+    is unchanged (a failing patch raises).
+    """
+
+    return os.environ.get("VLLM_GAUDI_SCOPE", "").strip().lower() in {"omni", "diffusion", "image", "video"}
+
+
+def _run_patch(name: str, patch: Callable[[], None], *, tolerant: bool) -> None:
+    """Run one runtime patch, or report it when the deployment does not need it."""
+
+    try:
+        patch()
+    except Exception:
+        if not tolerant:
+            raise
+        logger.warning("HPU runtime patch %s does not apply to this vLLM build; skipped", name, exc_info=True)
 
 
 def _patch_hpu_fx_stack_trace_parser() -> None:
@@ -930,19 +958,27 @@ def apply() -> None:
 
     def _load_general_with_hpu_patches():
         _original_load_general()
-        _patch_cleanup_dist_env_and_memory()
-        _patch_batched_count_greater_than()
-        _patch_gather_logprobs()
-        _patch_granite_hybrid_layer_types()
-        _patch_get_num_layers_by_block_type()
-        _patch_use_sequence_parallel_moe()
-        _patch_check_shm_free_space()
-        _patch_mamba_bind_kv_cache()
-        _patch_free_blocks()
-        _patch_sdpa_attention_forward()
-        _patch_inc_quantization_config()
-        from vllm_gaudi.v1.core import prefix_state_cache
-        prefix_state_cache.install()
+        tolerant = _diffusion_only_scope()
+        for name, patch in (
+            ("cleanup_dist_env_and_memory", _patch_cleanup_dist_env_and_memory),
+            ("batched_count_greater_than", _patch_batched_count_greater_than),
+            ("gather_logprobs", _patch_gather_logprobs),
+            ("granite_hybrid_layer_types", _patch_granite_hybrid_layer_types),
+            ("get_num_layers_by_block_type", _patch_get_num_layers_by_block_type),
+            ("use_sequence_parallel_moe", _patch_use_sequence_parallel_moe),
+            ("check_shm_free_space", _patch_check_shm_free_space),
+            ("mamba_bind_kv_cache", _patch_mamba_bind_kv_cache),
+            ("free_blocks", _patch_free_blocks),
+            ("sdpa_attention_forward", _patch_sdpa_attention_forward),
+            ("inc_quantization_config", _patch_inc_quantization_config),
+        ):
+            _run_patch(name, patch, tolerant=tolerant)
+
+        def _install_prefix_state_cache() -> None:
+            from vllm_gaudi.v1.core import prefix_state_cache
+            prefix_state_cache.install()
+
+        _run_patch("prefix_state_cache", _install_prefix_state_cache, tolerant=tolerant)
 
     _plugins_mod.load_general_plugins = _load_general_with_hpu_patches
 

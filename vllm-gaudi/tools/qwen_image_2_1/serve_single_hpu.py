@@ -208,6 +208,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cache-dir", type=Path,
                         default=Path(os.environ.get("VLLM_GAUDI_CACHE_DIR", os.path.expanduser("~/.cache"))),
                         help="writable cache root for vLLM-Omni scratch state (default ~/.cache)")
+    parser.add_argument("--plugins",
+                        default=os.environ.get("VLLM_PLUGINS", "hpu,01.hpu_custom_utils"),
+                        help="vLLM plugin entry points to load: the HPU platform plus its utility "
+                        "hooks; the LLM groups (ops/models/tool parsers) are excluded by default")
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--vae-use-tiling", action=argparse.BooleanOptionalAction, default=False,
                         help="tile the VAE decode (needed above about 1536^2)")
@@ -266,6 +270,11 @@ def main() -> int:
         PT_HPU_LAZY_MODE="0",
         PYTHONUNBUFFERED="1",
         PYTHONNOUSERSITE="1",
+        # Image/video only: load the HPU platform and its utility hooks, not the LLM plugin
+        # groups (ops, models, tool parsers). Those exist for the text models and their imports
+        # follow vLLM internals that move between releases.
+        VLLM_PLUGINS=args.plugins,
+        VLLM_GAUDI_SCOPE="omni",
         # vLLM-Omni writes a few scratch paths under the cache root; keep them off a read-only home.
         XDG_CACHE_HOME=str(cache_dir),
         VLLM_CACHE_ROOT=str(cache_dir / "vllm"),

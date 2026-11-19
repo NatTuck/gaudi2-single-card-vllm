@@ -1,78 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compatibility bridges for the vLLM and vLLM-Omni revisions.
+"""Import bridges for the vLLM / vLLM-Omni 0.32 pair on Gaudi.
 
-The pinned vLLM is older than the vLLM-Omni revision that carries Qwen-Image 2.1, and that
-revision imports a handful of vLLM names at module import time. Three kinds of bridge live here:
+Three things vLLM-Omni 0.32 imports are not importable from a vanilla vLLM 0.32:
 
-* module paths that moved (``vllm.entrypoints.*.protocol``),
-* names vLLM added to a package's ``__init__`` after the pin (``vllm.distributed`` re-exports),
-* names that did not exist yet (logging hooks, one dataclass, one quant method base).
+* names vLLM only defines in ``vllm.distributed.parallel_state`` /
+  ``vllm.distributed.communication_op``, which the diffusion models import from the package;
+* the ``vllm.v1.kv_hints`` module (AR-stage KV-cache hints, added after 0.32);
+* ``torchaudio``, which has no build matching the Gaudi torch.
 
-Only import-time compatibility is provided. The bridges are idempotent and are no-ops when the
-installed vLLM already has the name, so the pinned vLLM-Omni keeps running exactly as before.
+Each bridge is a no-op when the name or module already exists, so a later vLLM that ships them
+keeps working unchanged. Only import-time compatibility is provided.
 """
 
 from __future__ import annotations
 
-import logging
 import sys
 import types
 
 
-def _install_protocol_modules() -> None:
-    """Provide protocol module paths introduced after pinned vLLM."""
-
-    from vllm.entrypoints.openai.engine import protocol
-
-    for module_name in (
-            "vllm.entrypoints.generate.base.protocol",
-            "vllm.entrypoints.serve.engine.protocol",
-    ):
-        sys.modules.setdefault(module_name, protocol)
-
-
-def _install_logger_compat() -> None:
-    """Provide the runtime logging hooks newer vLLM-Omni calls into.
-
-    vLLM 0.28 configures its root logger when ``vllm.logger`` is imported and exposes no
-    runtime switch; later revisions added ``configure_logging`` / ``configure_logging_from_args``
-    for the CLI and the engine-core process. Both are pure logging configuration, so a bridge
-    that only honours an explicit level is equivalent for our purposes.
-    """
-
-    from vllm import logger as vllm_logger
-
-    def _set_level(level: object) -> None:
-        if level is None:
-            return
-        if isinstance(level, int):
-            logging.getLogger("vllm").setLevel(level)
-            return
-        if isinstance(level, str):
-            resolved = logging.getLevelName(level.upper())
-            if isinstance(resolved, int):
-                logging.getLogger("vllm").setLevel(resolved)
-
-    if not hasattr(vllm_logger, "configure_logging_from_args"):
-
-        def configure_logging_from_args(args: object) -> None:
-            _set_level(getattr(args, "log_level", None))
-
-        vllm_logger.configure_logging_from_args = configure_logging_from_args
-
-    if not hasattr(vllm_logger, "configure_logging"):
-
-        def configure_logging(logging_config: object) -> None:
-            level = getattr(logging_config, "log_level", None)
-            if level is None and isinstance(logging_config, str):
-                level = logging_config
-            _set_level(level)
-
-        vllm_logger.configure_logging = configure_logging
-
-
-# (package module, name, module that already defines it in the pinned vLLM)
+# (package module, name, module that already defines it in vLLM 0.32)
 _REEXPORTS: tuple[tuple[str, str, str], ...] = (
     ("vllm.distributed", "get_tp_group", "vllm.distributed.parallel_state"),
     ("vllm.distributed", "get_pp_group", "vllm.distributed.parallel_state"),
@@ -88,7 +35,7 @@ _REEXPORTS: tuple[tuple[str, str, str], ...] = (
 
 
 def _install_reexports() -> None:
-    """Re-publish names that later vLLM re-exports from a package ``__init__``."""
+    """Re-publish names that vLLM-Omni imports from a package that does not export them."""
 
     import importlib
 
@@ -102,50 +49,8 @@ def _install_reexports() -> None:
             setattr(package, name, value)
 
 
-def _install_symbol_stubs() -> None:
-    """Provide names that do not exist in the pinned vLLM at all.
-
-    None of these is on the diffusion path we serve; they are imported by modules that
-    vLLM-Omni loads eagerly (its model zoo, its benchmarks). A stand-in keeps the import
-    working, and the ``isinstance`` check below stays correct because nothing in the pinned
-    vLLM is an instance of the stand-in.
-    """
-
-    from vllm.config import multimodal as vllm_multimodal_config
-    from vllm.model_executor.layers.quantization import modelopt as vllm_modelopt
-    from vllm.multimodal.processing import processor as vllm_processor
-
-    if not hasattr(vllm_multimodal_config, "MultiModalDummyOptions"):
-
-        class MultiModalDummyOptions(dict):
-            """Per-modality dummy-data options container (added after pinned vLLM)."""
-
-            def __init__(self, options: object = None, **fields: object) -> None:
-                super().__init__(options or {})
-                self.__dict__.update(fields)
-
-        vllm_multimodal_config.MultiModalDummyOptions = MultiModalDummyOptions
-
-    if not hasattr(vllm_processor, "MultiModalProcessingResult"):
-
-        class MultiModalProcessingResult:
-            """Processed multimodal payload (added after pinned vLLM)."""
-
-            def __init__(self, **fields: object) -> None:
-                self.__dict__.update(fields)
-
-        vllm_processor.MultiModalProcessingResult = MultiModalProcessingResult
-
-    if not hasattr(vllm_modelopt, "ModelOptLinearMethod"):
-
-        class ModelOptLinearMethod:
-            """Common ModelOpt linear-method base (added after pinned vLLM)."""
-
-        vllm_modelopt.ModelOptLinearMethod = ModelOptLinearMethod
-
-
 def _install_module_stub(module_name: str, **attributes: object) -> types.ModuleType:
-    """Register a stand-in for a vLLM module that a newer vLLM-Omni imports but this vLLM lacks."""
+    """Register a stand-in for a vLLM module that this vLLM does not have."""
 
     existing = sys.modules.get(module_name)
     if existing is not None:
@@ -162,17 +67,17 @@ def _install_module_stub(module_name: str, **attributes: object) -> types.Module
 
 
 def _install_module_stubs() -> None:
-    """Stand-ins for vLLM modules that do not exist in the pinned revision.
+    """Stand-ins for vLLM modules this revision does not have.
 
-    ``vllm.v1.kv_hints`` carries the AR-stage KV-cache hint envelope. The diffusion path
-    rejects it explicitly ("kv_hints require an AR/LLM stage with a KV cache"), so the type
-    only has to exist for the annotations of the async engine to import.
+    ``vllm.v1.kv_hints`` carries the AR-stage KV-cache hint envelope. The diffusion path rejects
+    it explicitly ("kv_hints require an AR/LLM stage with a KV cache"), so the type only has to
+    exist for the annotations of the async engine to import.
     """
 
     import vllm.v1  # the parent package must exist before the attribute is set
 
     class KvHintsEnvelope:
-        """AR-stage KV-cache hints (added after pinned vLLM; unused by diffusion stages)."""
+        """AR-stage KV-cache hints (not present in vLLM 0.32; unused by diffusion stages)."""
 
         def __init__(self, **fields: object) -> None:
             self.__dict__.update(fields)
@@ -198,10 +103,10 @@ def _install_torchaudio_stub() -> None:
     """Stand in for ``torchaudio`` when the environment has no build matching this torch.
 
     vLLM-Omni imports ``torchaudio`` at module import time from its audio helpers (and from
-    several audio pipelines that its registry loads eagerly). The Gaudi PyTorch build here has
-    no matching torchaudio wheel, and a mismatched one fails on the extension ABI, so the audio
-    paths get a stand-in: every attribute exists, calling it raises. Image and video serving
-    never reaches them.
+    several audio pipelines that its registry loads eagerly). The Gaudi PyTorch build here has no
+    matching torchaudio wheel, and the CUDA wheel fails on the extension ABI, so the audio paths
+    get a stand-in: every attribute exists, calling it raises. Image and video serving never
+    reaches them.
     """
 
     import importlib.machinery
@@ -229,12 +134,9 @@ def _install_torchaudio_stub() -> None:
 
 
 def install_vllm_omni_compat() -> None:
-    """Install idempotent import bridges required by pinned vLLM-Omni."""
+    """Install idempotent import bridges required by vLLM-Omni 0.32."""
 
-    _install_protocol_modules()
-    _install_logger_compat()
     _install_reexports()
-    _install_symbol_stubs()
     _install_module_stubs()
     _install_torchaudio_stub()
 

@@ -10,12 +10,11 @@ logger = logging.getLogger(__name__)
 def _install_compat_early() -> None:
     """Install the vLLM import bridges before vLLM-Omni's own modules are imported.
 
-    vLLM-Omni imports ``vllm.logger.configure_logging_from_args`` and the
-    ``vllm.entrypoints.serve.engine.protocol`` module path at module import time, and it
-    imports them while the platform plugin is being resolved - before ``register_omni()``
-    runs. Installing the bridges at package import keeps that path working without touching
-    detection: an import failure here is logged and ignored, so probing still falls through
-    to the plugin's own return value.
+    vLLM-Omni imports ``vllm.distributed`` re-exports, ``vllm.v1.kv_hints`` and ``torchaudio``
+    while its platform plugin is being resolved - before ``register_omni()`` runs. Installing the
+    bridges at package import keeps that path working without touching detection: an import
+    failure here is logged and ignored, so probing still falls through to the plugin's own return
+    value.
     """
 
     try:
