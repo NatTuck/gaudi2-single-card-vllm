@@ -18,8 +18,8 @@ if [ -z "$MODEL" ]; then
 fi
 shift || true
 
-PY="${PYTHON:-$ROOT/.venv/bin/python}"
-[ -x "$PY" ] || { echo "missing $PY: install the environment first (docs/features/qwen_image_21.md)" >&2; exit 1; }
+PY="${PYTHON:-$ROOT/.venv032/bin/python}"
+[ -x "$PY" ] || { echo "missing $PY: install the vLLM 0.32 environment first (docs/features/qwen_image_21.md)" >&2; exit 1; }
 
 # The Gaudi Python needs the habanalabs library path; the plugin's own launcher forces the rest.
 export PYTHONPATH="${PYTHONPATH:-/usr/lib/habanalabs/}"
