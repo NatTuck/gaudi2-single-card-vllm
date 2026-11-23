@@ -9,6 +9,9 @@ import pytest
 import torch
 
 from vllm_gaudi.omni.minimax_h3 import (
+    _H3_LADDER_ASPECT_RATIO,
+    _H3_LADDER_SHORT_EDGES,
+    _h3_canvas_at_short_edge,
     _h3_ffv1_reference_video_command,
     _h3_phase_offload_enabled,
     _h3_row_parallel_weight_loader,
@@ -109,6 +112,60 @@ def test_lightx2v_canvas_patch_keeps_shared_base_preprocessing_strict():
     # ...while the shared helper stays strict for every other short edge.
     with pytest.raises(OmniClientError, match="must be 768"):
         preprocessing.resolve_minimax_h3_output_canvas(16 / 9, 544)
+
+
+def test_resolution_ladder_canvas_reproduces_the_released_geometry_at_768():
+    """The lower rungs must be the released policy, not a second opinion about it."""
+
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+        MINIMAX_H3_SUPPORTED_ASPECT_RATIOS,
+        resolve_minimax_h3_output_canvas,
+    )
+
+    for name, ratio in MINIMAX_H3_SUPPORTED_ASPECT_RATIOS.items():
+        assert _h3_canvas_at_short_edge(ratio, 768) == resolve_minimax_h3_output_canvas(ratio, 768), name
+
+
+def test_resolution_ladder_rungs_share_one_aspect_ratio_exactly():
+    rungs = [_h3_canvas_at_short_edge(_H3_LADDER_ASPECT_RATIO, edge) for edge in _H3_LADDER_SHORT_EDGES]
+    # (height, width) as the resolver returns them: draft, medium, high.
+    assert rungs == [(256, 448), (512, 896), (768, 1344)]
+    ratios = {width / height for height, width in rungs}
+    assert ratios == {7 / 4}
+    for height, width in rungs:
+        assert height % 32 == 0 and width % 32 == 0
+
+
+def test_resolution_ladder_canvas_is_the_same_policy_below_the_released_edge():
+    # 16:9 at short edge 256 lands on the grid the same way it does at 768, area cap and all.
+    assert _h3_canvas_at_short_edge(16 / 9, 256) == (256, 448)
+    # The area cap still applies: a ratio that would overflow it is scaled down, not clipped.
+    height, width = _h3_canvas_at_short_edge(21 / 9, 512)
+    assert width * height <= 768 * 1344
+
+
+def test_resolution_ladder_canvas_rejects_a_non_positive_request():
+    from vllm_omni.errors import OmniClientError
+
+    with pytest.raises(OmniClientError, match="aspect ratio must be positive"):
+        _h3_canvas_at_short_edge(0.0, 256)
+    with pytest.raises(OmniClientError, match="short_edge must be positive"):
+        _h3_canvas_at_short_edge(7 / 4, 0)
+
+
+def test_resolution_ladder_patch_accepts_the_lower_rungs_and_keeps_the_released_one():
+    install_minimax_h3_patches()
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing, preprocessing
+
+    resolve = encoder_processing.resolve_minimax_h3_output_canvas
+    assert resolve(_H3_LADDER_ASPECT_RATIO, 256) == (256, 448)
+    assert resolve(_H3_LADDER_ASPECT_RATIO, 512) == (512, 896)
+    # The released rung keeps coming from the released code path.
+    assert resolve(_H3_LADDER_ASPECT_RATIO, 768) == (768, 1344)
+    # Short edges outside the ladder are still refused by the shared helper.
+    with pytest.raises(OmniClientError, match="must be 768"):
+        preprocessing.resolve_minimax_h3_output_canvas(_H3_LADDER_ASPECT_RATIO, 512)
 
 
 def test_h3_encoder_fused_sdpa_disallows_implicit_cpu_fallback():

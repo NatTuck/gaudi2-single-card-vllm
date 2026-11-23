@@ -10,11 +10,11 @@ dependency group; it is not a separately maintained deployment.
 
 | Dependency | Qualified revision or version |
 | --- | --- |
-| vLLM | `680e2177` |
-| vLLM Omni | `767cc7977e04dc1f1ae7307e630429e9169af622` |
+| vLLM | **v0.32.0** (upstream tag, `VLLM_TARGET_DEVICE=empty`) |
+| vLLM Omni | **v0.32.0** |
 | PyTorch | 2.11 |
 | Habana framework plugin | 1.24.1 |
-| Transformers | 5.14.1 |
+| Transformers | 5.16.1 |
 | Diffusers | 0.40.0 |
 | ModelScope | 1.40.0 |
 | ImageIO FFmpeg | 0.6.0 |
@@ -596,3 +596,78 @@ checkpoint layout (`auto_map.AutoModel` in each component config), while the sna
 qualified native artifacts are the ones [ModelScope-only artifacts](#modelscope-only-artifacts)
 describes, built by `tools/minimax_h3/prepare_*_modelscope.py`. A 5 s T2VA run therefore needs that
 ~100 GB download before the timing can be compared with the 100.6 s figure above.
+
+## The 7:4 resolution ladder
+
+Three canvases that share **one aspect ratio exactly**, so a draft frames the shot the way the final
+render will:
+
+| Tier | Canvas | Mpx | rows/frame | steps | packed seq (text budget 2048) |
+| --- | --- | --- | --- | --- | --- |
+| `draft` | 448x256 | 0.115 | 112 | 8 | 6606 |
+| `medium` | 896x512 | 0.459 | 448 | 16 | 19038 |
+| `high` | 1344x768 | 1.032 | 1008 | 30 | 39758 |
+
+Each rung is exactly 1:2:3 in linear scale and 1:4:9 in pixels, both edges are multiples of 32 (the
+DiT patch stride, `canvas.multiple`), and none trips the released `768x1344` area cap.
+
+`rows_per_frame = W*H/1024` and `seq = T_lat*rows + 2*A + text_budget`, which reproduces every row
+of the released `buckets.json` table as well as these three.
+
+**Why 7:4 and not 16:9.** 32-alignment forces an exact ratio onto `w = 32pk`, `h = 32qk`, so exact
+16:9 is `512k x 288k`: the third rung (`1536x864`) is 1.33 Mpx, 28% over the area cap. Exact 16:9
+admits only **two** rungs under the cap. 7:4 is also what the released policy itself returns for a
+16:9 request at short edge 768 — `resolve_minimax_h3_output_canvas` scales to 1365x768, caps the
+area, then rounds each edge to 32 — so the `high` rung is bit-identical to the released canvas and
+this ladder is "the stock canvas at 1/9 and 4/9 the pixels" rather than a new geometry policy.
+
+Two ways to select a rung:
+
+```bash
+# vLLM-Omni request: short_edge picks the rung, aspect_ratio stays 1.75 for all three
+python tools/minimax_h3/request_video.py --short-edge 256 --aspect-ratio 1.75 ...
+
+# The port runner: a named bucket carries shape and step count together
+H3_PORT_DIR=/data/h3/hpu_port scripts/launch_h3.sh --prompt "..." --bucket draft
+```
+
+`_install_h3_resolution_ladder_hook()` rebinds only
+`encoder_processing.resolve_minimax_h3_output_canvas`, so `target.short_edge` accepts 256 and 512
+in addition to the released 768. The shared `preprocessing` helper keeps rejecting every other
+short edge, and the 768 rung is delegated to the released code path rather than recomputed
+(`test_resolution_ladder_canvas_reproduces_the_released_geometry_at_768` pins that for all six
+declared aspect ratios).
+
+## Per-block HPU graphs with ping-pong buffers
+
+`wrap_in_hpu_graph` pins each graph's user inputs **and** outputs, because the runtime cannot know
+that a caller will keep a reference to them. Wrapping the DiT as one graph is therefore fine (two
+tensors pinned); wrapping each of its 50 transformer blocks separately pins 50 inputs plus 50
+outputs. At 1280x704 one hidden-states tensor is ~360 MB, so per-block wrapping reserved ~32 GiB
+and the capture died at **94.9 / 96 GiB**.
+
+The blocks form a chain — block *i*'s output is block *i+1*'s input — so those 100 tensors only ever
+need to be two. `_PingPong` copies each block's output into one of two shared buffers (even blocks
+write A, odd blocks write B, so no block aliases its own pinned input), and the buffers are
+allocated from block 0's input by a **forward pre-hook**: before any wrapped forward runs, so the
+allocation stays outside the captured graph.
+
+This is on by default (`VLLM_GAUDI_H3_BLOCK_GRAPHS=0` restores whole-DiT wrapping). It supersedes
+the port's own `H3_PER_BLOCK_GRAPHS=1` opt-in, which wraps blocks without sharing their outputs and
+therefore still pays the 32 GiB.
+
+Measured on one Gaudi2, 1280x704 / 124 frames / 8 steps:
+
+| Configuration | Peak | generate |
+| --- | --- | --- |
+| whole-DiT graph | OOM at capture (94.9/96 GiB) | — |
+| no graphs | 95.2 GiB | 315.6 s |
+| per-block graphs + ping-pong, cold | 82-88 GiB | 293.4 s |
+| per-block graphs + ping-pong, warm | 82-88 GiB | 223.6 s |
+
+**The sequence guard.** The port rejects any request whose packed sequence exceeds
+`H3_MAX_GRAPH_SEQ` (20000) under CP=1 with graphs on, because a *whole-DiT* capture's host-side IR
+grows with the sequence (an r768/192f capture ballooned process RSS to 86.6 GB and was OOM-killed).
+Per-block capture bounds the IR by the largest single block, so that premise does not hold in this
+mode; `install()` lifts the cap to 65536 and says so, instead of letting the `medium` and `high`
+rungs be rejected for a reason that no longer applies.

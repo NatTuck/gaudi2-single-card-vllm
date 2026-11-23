@@ -31,6 +31,11 @@ _H3_DIT_TRACE_ARM_FILE_ENV = "VLLM_GAUDI_H3_DIT_TRACE_ARM_FILE"
 _H3_DIT_TRACE_STEP_ENV = "VLLM_GAUDI_H3_DIT_TRACE_STEP"
 _H3_BASE_OUTPUT_SHORT_EDGE = 768
 _LIGHTX2V_REF_OUTPUT_SHORT_EDGE = 544
+# Same-aspect-ratio resolution ladder: the released 768 short edge plus two lower rungs. At 7:4
+# every rung is exactly 32-aligned and under the area cap, so all three share one aspect ratio
+# (448x256 / 896x512 / 1344x768) and a draft frames the shot the way the final render will.
+_H3_LADDER_SHORT_EDGES = (256, 512, 768)
+_H3_LADDER_ASPECT_RATIO = 7.0 / 4.0
 _PATCHED = False
 
 
@@ -592,6 +597,81 @@ def _install_h3_ref2va_canvas_hook() -> None:
 
     encoder_processing.resolve_minimax_h3_output_canvas = resolve_output_canvas
     logger.info_once("Enabled MiniMax H3 Ref2VA 544p canvas support for the LightX2V four-step profile")
+
+
+def _h3_canvas_at_short_edge(aspect_ratio: float, short_edge: int) -> tuple[int, int]:
+    """Apply the official H3 ratio/area policy at an arbitrary short edge.
+
+    Same geometry as ``preprocessing.resolve_minimax_h3_output_canvas``: scale the requested
+    ratio onto the short edge, cap the area at ``MINIMAX_H3_OUTPUT_MAX_PIXELS``, round both
+    edges to 32. The stock helper hard-rejects every short edge but the released 768, which is
+    what confines H3 to one canvas per ratio; this is the identical geometry without that guard.
+
+    At 7:4 all three rungs land exactly on the 32 grid and none of them trips the area cap, so
+    they share one aspect ratio exactly: 448x256, 896x512, 1344x768 (rows_per_frame 112/448/1008).
+    """
+
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+        MINIMAX_H3_OUTPUT_MAX_PIXELS,
+        _align_multiple,
+    )
+
+    if not math.isfinite(float(aspect_ratio)) or float(aspect_ratio) <= 0:
+        raise OmniClientError(f"MiniMax H3 canvas aspect ratio must be positive, got {aspect_ratio!r}")
+    if int(short_edge) <= 0:
+        raise OmniClientError(f"MiniMax H3 target.short_edge must be positive, got {short_edge!r}")
+    if aspect_ratio >= 1.0:
+        width = float(short_edge) * float(aspect_ratio)
+        height = float(short_edge)
+    else:
+        width = float(short_edge)
+        height = float(short_edge) / float(aspect_ratio)
+    area = width * height
+    if area > MINIMAX_H3_OUTPUT_MAX_PIXELS:
+        scale = (MINIMAX_H3_OUTPUT_MAX_PIXELS / area)**0.5
+        width *= scale
+        height *= scale
+    return _align_multiple(height, 32), _align_multiple(width, 32)
+
+
+def _install_h3_resolution_ladder_hook() -> None:
+    """Let a request pick a lower rung of a same-aspect-ratio resolution ladder.
+
+    ``encoder_processing.resolve_minimax_h3_shape`` resolves the canvas through the module-level
+    ``resolve_minimax_h3_output_canvas`` binding, which accepts only the released 768 short edge.
+    Rebinding that one import lets ``target.short_edge`` also select 256 or 512, so one prompt can
+    be drafted small and re-rendered large with the framing unchanged. Only the binding is
+    replaced: the shared helper keeps its own guard for every other caller.
+
+    The stock 768 rung is delegated, not recomputed, so the released canvas keeps coming from the
+    released code path. Installing this hook before or after the Ref2VA canvas hook composes
+    either way, because each defers on the short edges it does not own.
+    """
+
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing
+
+    original_canvas = encoder_processing.resolve_minimax_h3_output_canvas
+
+    def resolve_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, int]:
+        edge = int(short_edge)
+        if edge in _H3_LADDER_SHORT_EDGES and edge != _H3_BASE_OUTPUT_SHORT_EDGE:
+            height, width = _h3_canvas_at_short_edge(aspect_ratio, edge)
+            logger.info_once(
+                "MiniMax H3 resolution ladder: short_edge=%d -> %dx%d (aspect %.4f)",
+                edge,
+                width,
+                height,
+                float(aspect_ratio),
+            )
+            return height, width
+        return original_canvas(aspect_ratio, short_edge)
+
+    encoder_processing.resolve_minimax_h3_output_canvas = resolve_output_canvas
+    logger.info_once(
+        "Enabled MiniMax H3 same-aspect-ratio resolution ladder "
+        "(7:4 at short edges 256/512/768 -> 448x256, 896x512, 1344x768)"
+    )
 
 
 def _parse_ffmpeg_video_encoders(output: str) -> frozenset[str]:
@@ -1481,6 +1561,7 @@ def install_minimax_h3_patches() -> None:
         ("modulation_ops", _install_h3_modulation_ops),
         ("encoder_attention", _install_h3_encoder_attention_hooks),
         ("ref2va_canvas", _install_h3_ref2va_canvas_hook),
+        ("resolution_ladder", _install_h3_resolution_ladder_hook),
         ("reference_video_transcode", _install_h3_reference_video_transcode_hook),
         ("fasth3", _install_fasth3_hooks),
         ("layout_and_noise", _install_h3_layout_and_noise_hooks),
