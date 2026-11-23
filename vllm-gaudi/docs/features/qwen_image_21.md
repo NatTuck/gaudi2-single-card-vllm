@@ -117,6 +117,15 @@ sequence below uses `uv`. Two traps: the diffusion dependency set pulls a CUDA `
 (it shadows the Gaudi build and breaks `habana_frameworks`), and a user-site `peft` shadows the
 venv's `diffusers`.
 
+The `vLLM_TARGET_DEVICE=empty` editable install means the checkout is **the** `vllm` package: there
+are no compiled extensions to survive on their own. Put it on durable storage, not `/tmp` — a
+`/tmp` checkout was lost once and left `.venv032` with a `.pth` pointing at nothing, so every import
+of `vllm` failed while `vllm_omni` and `vllm_gaudi` still resolved. The current install is
+`vendor/vllm-0.32.0` (tag `v0.32.0`, commit `5df63a7`); recreate it with
+`git clone --depth 1 --branch v0.32.0 https://github.com/vllm-project/vllm vendor/vllm-0.32.0` and
+re-run the editable install below. To repair an existing venv instead, point
+`site-packages/__editable__.vllm-*.pth` and the dist-info's `direct_url.json` at the new path.
+
 ```bash
 cd gaudi2-single-card-vllm
 export UV_CACHE_DIR=/tmp/uv-cache PYTHONPATH=/usr/lib/habanalabs/ PYTHONNOUSERSITE=1

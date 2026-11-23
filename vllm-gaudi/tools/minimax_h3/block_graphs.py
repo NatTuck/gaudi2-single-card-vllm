@@ -29,14 +29,19 @@ reason that no longer applies.
 
 The resolution ladder
 ---------------------
-Three canvases that share one aspect ratio exactly, so a draft frames the shot the way the final
-render will. Both edges must be multiples of 32 (the DiT patch stride) and the area must stay
-under the released 768x1344 cap; at 7:4 every rung satisfies both with no rounding:
+Three canvases that share one aspect ratio exactly, so every rung composites into the same output
+frame without cropping or letterboxing. Both edges must be multiples of 32 (the DiT patch stride)
+and the area must stay under the released 768x1344 cap; at 7:4 every rung satisfies both with no
+rounding:
 
     tier     canvas      pixels    rows/frame   seq @124f, budget 2048
     draft    448x256     0.115M    112           6606
     medium   896x512     0.459M    448          19038
     high     1344x768    1.032M   1008          39758
+
+This does NOT make a draft a preview of the high render. The initial noise is drawn at the latent
+shape, so the same seed gives a different shot at every rung (measured: three different
+compositions of the same prompt). What is preserved is the frame geometry, not the content.
 
 Exact 16:9 cannot do this: 32-alignment forces 512k x 288k, and the third rung (1536x864) is 28%
 over the area cap. 7:4 is also what the released policy itself returns for a 16:9 request at short

@@ -33,7 +33,9 @@ _H3_BASE_OUTPUT_SHORT_EDGE = 768
 _LIGHTX2V_REF_OUTPUT_SHORT_EDGE = 544
 # Same-aspect-ratio resolution ladder: the released 768 short edge plus two lower rungs. At 7:4
 # every rung is exactly 32-aligned and under the area cap, so all three share one aspect ratio
-# (448x256 / 896x512 / 1344x768) and a draft frames the shot the way the final render will.
+# (448x256 / 896x512 / 1344x768) and every rung composites into the same output frame. The initial
+# noise is drawn at the latent shape, so this preserves the frame geometry, not the shot: the same
+# seed yields a different composition at each rung.
 _H3_LADDER_SHORT_EDGES = (256, 512, 768)
 _H3_LADDER_ASPECT_RATIO = 7.0 / 4.0
 _PATCHED = False
@@ -640,9 +642,11 @@ def _install_h3_resolution_ladder_hook() -> None:
 
     ``encoder_processing.resolve_minimax_h3_shape`` resolves the canvas through the module-level
     ``resolve_minimax_h3_output_canvas`` binding, which accepts only the released 768 short edge.
-    Rebinding that one import lets ``target.short_edge`` also select 256 or 512, so one prompt can
-    be drafted small and re-rendered large with the framing unchanged. Only the binding is
-    replaced: the shared helper keeps its own guard for every other caller.
+    Rebinding that one import lets ``target.short_edge`` also select 256 or 512, so a prompt can be
+    drafted small before a full-size render. The rungs share a frame geometry, not a shot: the
+    initial noise is drawn at the latent shape, so the same seed gives a different composition at
+    each rung. Only the binding is replaced: the shared helper keeps its own guard for every other
+    caller.
 
     The stock 768 rung is delegated, not recomputed, so the released canvas keeps coming from the
     released code path. Installing this hook before or after the Ref2VA canvas hook composes

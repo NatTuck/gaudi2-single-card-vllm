@@ -599,8 +599,8 @@ describes, built by `tools/minimax_h3/prepare_*_modelscope.py`. A 5 s T2VA run t
 
 ## The 7:4 resolution ladder
 
-Three canvases that share **one aspect ratio exactly**, so a draft frames the shot the way the final
-render will:
+Three canvases that share **one aspect ratio exactly**, so every rung composites into the same
+output frame with no cropping or letterboxing:
 
 | Tier | Canvas | Mpx | rows/frame | steps | packed seq (text budget 2048) |
 | --- | --- | --- | --- | --- | --- |
@@ -620,6 +620,38 @@ admits only **two** rungs under the cap. 7:4 is also what the released policy it
 16:9 request at short edge 768 — `resolve_minimax_h3_output_canvas` scales to 1365x768, caps the
 area, then rounds each edge to 32 — so the `high` rung is bit-identical to the released canvas and
 this ladder is "the stock canvas at 1/9 and 4/9 the pixels" rather than a new geometry policy.
+
+### Measured on one Gaudi2
+
+5 s / 124 frames, one seed, per-block graphs with ping-pong buffers, recipe cache warm after the
+first run of each shape. `generate` is the port's own wall clock around the pipeline call; `export`
+and `mux` are separate.
+
+| Tier | Canvas | Steps | generate | export | mux | total |
+| --- | --- | --- | --- | --- | --- | --- |
+| `draft` | 448x256 | 8 | **11.3 s** | 4.8 | 1.4 | 17.5 s |
+| `medium` | 896x512 | 16 | **136.6 s** | 20.4 | 1.8 | 158.8 s |
+| `high` | 1344x768 | 30 | **1243.5 s** | 50.7 | 2.9 | 1297 s |
+
+A cold run of a shape pays a one-off graph capture: `medium` was 186.4 s cold against 136.6 s warm,
+so ~50 s of the first request at a new canvas is compilation. `high` fits at 1344x768 with per-block
+graphs — the whole-DiT graph OOMs at capture at that size.
+
+Where the time goes changes with the rung, which matters for tuning:
+
+- `draft` is **VAE-decode bound**: 8 denoising steps cost well under a second of device time, while
+  the decode of 124 frames at 448x256 dominates. Adding steps to a draft is nearly free; making it
+  smaller is not what makes it faster.
+- `high` is **denoise bound**: 29 steps at ~28.5 s/step is ~830 s, against ~407 s of decode. Steps
+  and resolution both cost, and attention is superlinear in the packed sequence (1344x768 is 14.5%
+  more rows than 1280x704 but ~44% more time per step).
+
+The ladder does **not** make a draft a preview of the high render. The initial noise is drawn at the
+latent shape, so the same seed produces a different composition at each rung (three visibly
+different shots of one prompt). What the ladder preserves is the frame geometry: same aspect ratio,
+both edges 32-aligned, so nothing needs cropping or letterboxing when the rungs are cut together.
+Use a draft to check that the model reads the prompt and to measure a pipeline, not to preview a
+specific shot.
 
 Two ways to select a rung:
 
