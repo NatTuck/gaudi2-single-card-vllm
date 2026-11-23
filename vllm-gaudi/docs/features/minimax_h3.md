@@ -580,7 +580,14 @@ H3 hook layer was ported to that revision:
 | DiT constructor patch | forwards keyword-only arguments (`diffusers_weights`, `attention_cls`) that 0.32 added |
 
 `install_minimax_h3_patches()` now installs each hook independently and reports which ones do not
-apply, so a moved upstream seam cannot take the others down. On vLLM-Omni v0.32.0 all ten install.
+apply, so a moved upstream seam cannot take the others down.
+
+The launcher no longer needs a module id: `serve_single_hpu.py` leases the first idle module that
+is visible to the process (`HABANA_VISIBLE_MODULES` is honoured and a card without a
+`/dev/accel` node is not a candidate), and `--module N` is an opt-in pin that fails fast when
+that id is not visible. The `--module 0` examples earlier in this guide record the pinned
+configuration those measurements were taken on.
+ On vLLM-Omni v0.32.0 all ten install.
 The H3 unit tests in `tests/unit_tests/omni/` pass (96 passed, 1 skipped for the whole suite).
 
 **Not yet exercised end to end:** the vLLM-Omni 0.32 H3 adapter loads the **native**

@@ -48,14 +48,17 @@ patch that no longer applies instead of aborting the server; without it the beha
 
 ```bash
 tools/qwen_image_2_1/serve_single_hpu.py /path/to/Qwen-Image-2.1 \
-    --module 6 --port 8091 --compile \
+    --port 8091 --compile \
     --cache-dir ~/.cache/gaudi2-qwen-image
 ```
 
-The launcher leases one idle module (`fuser` on `/dev/accel/accelN` plus an `hl-smi` idle check
-under a `flock`), pins the module's NUMA CPUs, forces the Hugging Face caches offline, sets
-`PT_HPU_LAZY_MODE=0`, and starts `vllm serve --omni --diffusion-attention-backend HPU_SDPA
---enforce-eager`. Warm-up requests compile the DiT graphs before the first user request; disable
+No `--module` by default: the launcher leases the first idle module **visible to this process**
+(`HABANA_VISIBLE_MODULES` is honoured, and a card without a `/dev/accel` node is never a
+candidate), takes its lock (`fuser` plus an `hl-smi` idle check under a `flock`), pins that
+module's NUMA CPUs, forces the Hugging Face caches offline, sets `PT_HPU_LAZY_MODE=0`, and starts
+`vllm serve --omni --diffusion-attention-backend HPU_SDPA`. Pass `--module N` only to pin a
+specific card; an id that is not visible fails immediately instead of waiting. Warm-up requests
+compile the DiT graphs before the first user request; disable
 them with `--no-warmup`.
 
 Requests use the OpenAI chat endpoint, with the diffusion parameters in `extra_body`:

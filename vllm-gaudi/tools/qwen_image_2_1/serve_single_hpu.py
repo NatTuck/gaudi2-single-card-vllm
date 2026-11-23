@@ -7,8 +7,13 @@ The diffusion models never share the card with the 27B service (README, "Image
 and video generation"): this launcher takes the module lock, checks the card is
 idle, pins the NUMA CPUs, and only then starts ``vllm serve --omni``.
 
-    tools/qwen_image_2_1/serve_single_hpu.py /path/to/Qwen-Image-2.1 --module 6
+    tools/qwen_image_2_1/serve_single_hpu.py /path/to/Qwen-Image-2.1
     tools/qwen_image_2_1/serve_single_hpu.py MODEL -- --max-num-seqs 1
+    tools/qwen_image_2_1/serve_single_hpu.py MODEL --module 4   # explicit pin, opt-in only
+
+By default the launcher leases the first idle module that is visible to this process:
+``HABANA_VISIBLE_MODULES`` is honoured and a card without a ``/dev/accel`` node is never a
+candidate. Pass ``--module`` only to pin a specific card.
 
 Environment:
     VLLM_GAUDI_LOCK_DIR        shared device-lock directory (default /tmp/1cat-gaudi-module-locks)
@@ -50,16 +55,46 @@ def _parse_cpuset(value: str) -> set[int]:
     return result
 
 
+def _visible_modules() -> set[int] | None:
+    """Module ids this process may use, from ``HABANA_VISIBLE_MODULES``.
+
+    ``None`` means the environment does not restrict us: every accelerator whose device node
+    exists is a candidate. The container decides what exists, so the node check is what keeps a
+    card that is attached to the host but not to this process out of the lease.
+    """
+
+    raw = os.environ.get("HABANA_VISIBLE_MODULES", "").strip()
+    if not raw:
+        return None
+    modules: set[int] = set()
+    for field in raw.split(","):
+        field = field.strip()
+        if not field:
+            continue
+        try:
+            modules.add(int(field))
+        except ValueError:
+            continue
+    return modules or None
+
+
 def _accelerators() -> list[dict[str, Any]]:
+    allowed = _visible_modules()
     devices = []
     for accelerator in sorted(Path("/sys/class/accel").glob("accel[0-9]*")):
         device = accelerator / "device"
+        node = Path("/dev/accel") / accelerator.name
+        if not node.exists():
+            continue
         try:
+            module = int((device / "module_id").read_text())
+            if allowed is not None and module not in allowed:
+                continue
             devices.append({
-                "module": int((device / "module_id").read_text()),
+                "module": module,
                 "numa": int((device / "numa_node").read_text()),
                 "bus": device.resolve().name,
-                "node": Path("/dev/accel") / accelerator.name,
+                "node": node,
             })
         except (FileNotFoundError, ValueError):
             continue
@@ -199,7 +234,9 @@ def _warmup(args: argparse.Namespace) -> None:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("model", type=Path, help="local Qwen-Image 2.1 diffusers-layout directory")
-    parser.add_argument("--module", type=int, help="physical module ID; otherwise lease the first idle module")
+    parser.add_argument("--module", type=int,
+                        help="pin to this module id; by default the launcher leases the first "
+                        "idle module visible to this process (HABANA_VISIBLE_MODULES is honoured)")
     parser.add_argument("--lock-dir", type=Path, default=_DEFAULT_LOCK_DIR)
     parser.add_argument("--cpu-affinity", help="taskset-style CPU list; defaults to the selected module's NUMA node")
     parser.add_argument("--poll-seconds", type=float, default=30.0)
@@ -239,6 +276,9 @@ def main() -> int:
     args.model = _checkpoint(args.model)
     args.lock_dir.mkdir(parents=True, exist_ok=True)
 
+    visible = sorted(device["module"] for device in _accelerators())
+    if args.module is not None and args.module not in visible:
+        raise SystemExit(f"module {args.module} is not visible to this process; available: {visible}")
     lease = _try_lease(args.lock_dir, args.module)
     while lease is None:
         target = f"module {args.module}" if args.module is not None else "an idle module"
