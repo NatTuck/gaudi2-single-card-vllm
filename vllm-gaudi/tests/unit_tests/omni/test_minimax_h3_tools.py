@@ -87,14 +87,16 @@ def _write_fp8_partition(root: Path, partition: str) -> Path:
     return target
 
 
-def test_pinned_omni_base_schedule_has_50_points_and_49_joint_forwards():
+def test_base_schedule_has_one_point_per_forward_plus_the_endpoint():
+    """``num_steps`` counts forwards; the sigma list carries the extra endpoint (vLLM-Omni 0.32)."""
+
     video = minimax_h3_time_shift_sigmas(num_steps=50, shift_scale=12.0)
     audio = minimax_h3_time_shift_sigmas(num_steps=50, shift_scale=3.0)
 
-    assert len(video) == len(audio) == 50
+    assert len(video) == len(audio) == 51
     assert video[0] == audio[0] == 1.0
     assert video[-1] == audio[-1] == 0.0
-    assert len(video) - 1 == 49
+    assert len(video) - 1 == 50
 
 
 def test_request_omits_sampling_fields_for_explicit_pinned_omni_reference():

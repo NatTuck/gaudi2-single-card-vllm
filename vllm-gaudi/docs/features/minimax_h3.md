@@ -10,14 +10,14 @@ dependency group; it is not a separately maintained deployment.
 
 | Dependency | Qualified revision or version |
 | --- | --- |
-| vLLM | `680e2177` |
-| vLLM Omni | `767cc7977e04dc1f1ae7307e630429e9169af622` |
+| vLLM | **v0.32.0** (upstream tag, `VLLM_TARGET_DEVICE=empty`) |
+| vLLM Omni | **v0.32.0** |
 | PyTorch | 2.11 |
 | Habana framework plugin | 1.24.1 |
-| Transformers | 5.14.1 |
+| Transformers | 5.16.1 |
 | Diffusers | 0.40.0 |
 | ModelScope | 1.40.0 |
-| ImageIO FFmpeg | 0.6.0 |
+| imageio / ffmpeg | `imageio[ffmpeg]>=2.37.2` |
 
 Install the multimodal dependencies only where H3 serving is needed:
 
@@ -564,3 +564,160 @@ activation row, apply per-output-channel weight scales, and dispatch
 declared precision. The serialized native ModelOpt FP8 path uses the same HPU
 GEMM contract. Host work is limited to tokenization, media preparation, request
 scheduling, and MP4 encoding.
+
+## vLLM-Omni 0.32 port status
+
+This checkout now targets **vLLM v0.32.0 + vLLM-Omni v0.32.0** (see
+[Qwen-Image 2.1](qwen_image_21.md) for the dependency set and the image/video-only scope). The
+H3 hook layer was ported to that revision:
+
+| Hook | State on vLLM-Omni 0.32.0 |
+| --- | --- |
+| modulation ops | re-pointed: the helpers moved from `diffusion/attention/ops/minimax_h3_modulation.py` (removed) to `diffusion/layers/indexed_modulation.py`, same four names |
+| encoder attention / encoder `__init__` / weight mapping | installed unchanged |
+| Ref2VA 544p canvas | re-anchored on `encoder_processing.resolve_minimax_h3_output_canvas` (the pipeline's `_resolve_output_canvas`/`_resolve_shape` no longer exist); the shared preprocessing helper stays strict |
+| reference-video transcode, FastH3, layout/noise, VAE, phase offload, trajectory, DiT trace | installed unchanged |
+| DiT constructor patch | forwards keyword-only arguments (`diffusers_weights`, `attention_cls`) that 0.32 added |
+
+`install_minimax_h3_patches()` now installs each hook independently and reports which ones do not
+apply, so a moved upstream seam cannot take the others down.
+
+The launcher no longer needs a module id: `serve_single_hpu.py` leases the first idle module that
+is visible to the process (`HABANA_VISIBLE_MODULES` is honoured and a card without a
+`/dev/accel` node is not a candidate), and `--module N` is an opt-in pin that fails fast when
+that id is not visible. The `--module 0` examples earlier in this guide record the pinned
+configuration those measurements were taken on.
+ On vLLM-Omni v0.32.0 all twelve install.
+The H3 unit tests in `tests/unit_tests/omni/` pass (130 passed, 1 skipped for the whole suite).
+
+**Not yet exercised end to end:** the vLLM-Omni 0.32 H3 adapter loads the **native**
+checkpoint layout (`auto_map.AutoModel` in each component config), while the snapshot on this host
+(`models--MiniMaxAI--MiniMax-H3`, the diffusers variant) carries `_class_name` configs. The
+qualified native artifacts are the ones [ModelScope-only artifacts](#modelscope-only-artifacts)
+describes, built by `tools/minimax_h3/prepare_*_modelscope.py`. A 5 s T2VA run therefore needs that
+~100 GB download before the timing can be compared with the 100.6 s figure above.
+
+## The 7:4 resolution ladder
+
+Three canvases that share **one aspect ratio exactly**, so every rung composites into the same
+output frame with no cropping or letterboxing:
+
+| Tier | Canvas | Mpx | rows/frame | steps | packed seq (text budget 2048) |
+| --- | --- | --- | --- | --- | --- |
+| `draft` | 448x256 | 0.115 | 112 | 8 | 6606 |
+| `medium` | 896x512 | 0.459 | 448 | 16 | 19038 |
+| `high` | 1344x768 | 1.032 | 1008 | 30 | 39758 |
+
+Each rung is exactly 1:2:3 in linear scale and 1:4:9 in pixels, both edges are multiples of 32 (the
+DiT patch stride, `canvas.multiple`), and none trips the released `768x1344` area cap.
+
+`rows_per_frame = W*H/1024` and `seq = T_lat*rows + 2*A + text_budget`, which reproduces every row
+of the released `buckets.json` table as well as these three.
+
+**Why 7:4 and not 16:9.** 32-alignment forces an exact ratio onto `w = 32pk`, `h = 32qk`, so exact
+16:9 is `512k x 288k`: the third rung (`1536x864`) is 1.33 Mpx, 28% over the area cap. Exact 16:9
+admits only **two** rungs under the cap. 7:4 is also what the released policy itself returns for a
+16:9 request at short edge 768 — `resolve_minimax_h3_output_canvas` scales to 1365x768, caps the
+area, then rounds each edge to 32 — so the `high` rung is bit-identical to the released canvas and
+this ladder is "the stock canvas at 1/9 and 4/9 the pixels" rather than a new geometry policy.
+
+### Measured on one Gaudi2
+
+5 s / 124 frames, one seed, per-block graphs with ping-pong buffers, recipe cache warm after the
+first run of each shape. `generate` is the port's own wall clock around the pipeline call; `export`
+and `mux` are separate.
+
+| Tier | Canvas | Steps | generate | export | mux | total |
+| --- | --- | --- | --- | --- | --- | --- |
+| `draft` | 448x256 | 8 | **11.3 s** | 4.8 | 1.4 | 17.5 s |
+| `medium` | 896x512 | 16 | **136.6 s** | 20.4 | 1.8 | 158.8 s |
+| `high` | 1344x768 | 30 | **1243.5 s** | 50.7 | 2.9 | 1297 s |
+
+A cold run of a shape pays a one-off graph capture: `medium` was 186.4 s cold against 136.6 s warm,
+so ~50 s of the first request at a new canvas is compilation. `high` fits at 1344x768 with per-block
+graphs — the whole-DiT graph OOMs at capture at that size.
+
+These are harness numbers, not product numbers, and the harness is part of the configuration: lazy
+mode with `PT_HPU_AUTOLOAD=1`, an 8 GB disk recipe cache, `--te-threads 8`, and a warm prompt-embed
+cache, measured through `scripts/launch_h3.sh` on the diffusers-modular port rather than on
+vLLM-Omni. Changing any of those changes the numbers; the recipe cache in particular is what turns a
+cold rung into a warm one.
+
+Where the time goes changes with the rung, which matters for tuning:
+
+- `draft` is **VAE-decode bound**: 8 denoising steps cost well under a second of device time, while
+  the decode of 124 frames at 448x256 dominates. Adding steps to a draft is nearly free; making it
+  smaller is not what makes it faster.
+- `high` is **denoise bound**: 29 steps at ~28.5 s/step is ~830 s, against ~407 s of decode. Steps
+  and resolution both cost, and attention is superlinear in the packed sequence (1344x768 is 14.5%
+  more rows than 1280x704 but ~44% more time per step).
+
+The ladder does **not** make a draft a preview of the high render. The initial noise is drawn at the
+latent shape, so the same seed produces a different composition at each rung (three visibly
+different shots of one prompt). What the ladder preserves is the frame geometry: same aspect ratio,
+both edges 32-aligned, so nothing needs cropping or letterboxing when the rungs are cut together.
+Use a draft to check that the model reads the prompt and to measure a pipeline, not to preview a
+specific shot.
+
+Two ways to select a rung:
+
+```bash
+# vLLM-Omni request: ask for 16:9, then pick the rung with short_edge. The released policy already
+# maps 16:9 onto 7:4, so 16:9 at 768/512/256 is exactly the high/medium/draft ladder.
+python tools/minimax_h3/request_video.py --aspect-ratio 16:9 --short-edge 256 ...
+
+# The port runner: a named bucket carries shape and step count together
+H3_PORT_DIR=/data/h3/hpu_port scripts/launch_h3.sh --prompt "..." --bucket draft
+```
+
+A lower rung is offered only when it lands on the same aspect ratio as the released 768 rung for the
+requested ratio. Rounding each edge to 32 is exact at 7:4 (and so at 16:9, which maps onto 7:4),
+1:1 and 9:16; at 4:3, 3:4 and 21:9 the rungs come out as three different frames
+(4:3 gives 352x256 / 672x512 / 1024x768), so those ratios are refused rather than handed a canvas
+that will not cut together with the 768 render.
+
+`_install_h3_resolution_ladder_hook()` rebinds only
+`encoder_processing.resolve_minimax_h3_output_canvas`, so `target.short_edge` accepts 256 and 512
+in addition to the released 768. The shared `preprocessing` helper keeps rejecting every other
+short edge, and the 768 rung is delegated to the released code path rather than recomputed
+(`test_resolution_ladder_canvas_reproduces_the_released_geometry_at_768` pins that for all six
+declared aspect ratios).
+
+## Per-block HPU graphs with ping-pong buffers
+
+`wrap_in_hpu_graph` pins each graph's user inputs **and** outputs, because the runtime cannot know
+that a caller will keep a reference to them. Wrapping the DiT as one graph is therefore fine (two
+tensors pinned); wrapping each of its 50 transformer blocks separately pins 50 inputs plus 50
+outputs. At 1280x704 one hidden-states tensor is ~360 MB, so per-block wrapping reserved ~32 GiB
+and the capture died at **94.9 / 96 GiB**.
+
+The blocks form a chain — block *i*'s output is block *i+1*'s input — so those 100 tensors only ever
+need to be two. `_PingPong` copies each block's output into one of two shared buffers (even blocks
+write A, odd blocks write B, so no block aliases its own pinned input), and the buffers are
+allocated from block 0's input by a **forward pre-hook**: before any wrapped forward runs, so the
+allocation stays outside the captured graph.
+
+This is on by default (`VLLM_GAUDI_H3_BLOCK_GRAPHS=0` restores whole-DiT wrapping). It supersedes
+the port's own `H3_PER_BLOCK_GRAPHS=1` opt-in, which wraps blocks without sharing their outputs and
+therefore still pays the 32 GiB.
+
+Measured on one Gaudi2, 1280x704 / 124 frames / 8 steps:
+
+| Configuration | Peak | generate |
+| --- | --- | --- |
+| whole-DiT graph | OOM at capture (94.9/96 GiB) | — |
+| no graphs | 95.2 GiB | 315.6 s |
+| per-block graphs + ping-pong, cold | 82-88 GiB | 293.4 s |
+| per-block graphs + ping-pong, warm | 82-88 GiB | 223.6 s |
+
+**The sequence guard.** The port rejects any request whose packed sequence exceeds
+`H3_MAX_GRAPH_SEQ` (20000) under CP=1 with graphs on, because a *whole-DiT* capture's host-side IR
+grows with the sequence (an r768/192f capture ballooned process RSS to 86.6 GB and was OOM-killed).
+Per-block capture bounds the IR by the largest single block, so that premise does not hold in this
+mode, and `install()` lifts the cap to 65536.
+
+Two things to be precise about. The guard lives in the port's *server* request path
+(`_server_apply_params`), so a single-shot `--bucket` run never evaluates it — the lift is inert
+there and only matters under `H3_SERVER_MODE`. And of the three rungs only `high` is over the
+default cap: `draft` is 5070 and `medium` is 17502 against 20000 at the released text budget of
+512 (6606 / 19038 at `--text-budget 2048`), while `high` is 38222 / 39758.

@@ -137,11 +137,13 @@ setup(
         # not install video/audio dependencies. This commit is the H3 pipeline
         # baseline qualified with this plugin.
         "omni": [
-            "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@767cc7977e04dc1f1ae7307e630429e9169af622",
-            "transformers==5.14.1",
+            "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.32.0",
+            "transformers==5.16.1",
+            "tokenizers>=0.23.2,<0.24",
             "diffusers==0.40.0",
+            "accelerate==1.12.0",
             "modelscope==1.40.0",
-            "imageio-ffmpeg==0.6.0",
+            "imageio[ffmpeg]>=2.37.2",
         ],
     },
     entry_points={

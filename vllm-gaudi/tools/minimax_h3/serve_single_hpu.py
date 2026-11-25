@@ -20,6 +20,8 @@ import sys
 import time
 from typing import IO, Any
 
+# A second idle sample this far after the first: one hl-smi read can catch a card mid teardown.
+_IDLE_RECHECK_SECONDS = 3.0
 _FLASHGEN_FILENAME = "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
 _FLASHGEN_METADATA = {
     "key_format": "minimax-h3-native",
@@ -119,26 +121,61 @@ def _prepend_media_path(environment: dict[str, str], media_bin: Path) -> None:
     environment["PATH"] = str(media_bin) + (os.pathsep + current if current else "")
 
 
+def _visible_modules() -> set[int] | None:
+    """Module ids this process may use, from ``HABANA_VISIBLE_MODULES``.
+
+    ``None`` means the environment does not restrict us: every accelerator whose device node
+    exists is a candidate. The container decides what exists, so the node check is what keeps a
+    card that is attached to the host but not to this process out of the lease.
+    """
+
+    raw = os.environ.get("HABANA_VISIBLE_MODULES", "").strip()
+    if not raw:
+        return None
+    modules: set[int] = set()
+    unparsed: list[str] = []
+    for field in raw.split(","):
+        field = field.strip()
+        if not field:
+            continue
+        try:
+            modules.add(int(field))
+        except ValueError:
+            unparsed.append(field)
+    if unparsed:
+        # Fail closed. Treating an unreadable filter as "no filter" would lease a card the operator
+        # meant to exclude, which is the opposite of what HABANA_VISIBLE_MODULES is for.
+        raise SystemExit(
+            "HABANA_VISIBLE_MODULES contains entries this launcher cannot read as module ids: "
+            f"{unparsed} (full value {raw!r}). Use a comma-separated list of ids, e.g. '4,5'."
+        )
+    return modules
+
+
 def _accelerators() -> list[dict[str, Any]]:
+    allowed = _visible_modules()
     devices = []
     for accelerator in sorted(Path("/sys/class/accel").glob("accel[0-9]*")):
         device = accelerator / "device"
+        node = Path("/dev/accel") / accelerator.name
+        if not node.exists():
+            continue
         try:
+            module = int((device / "module_id").read_text())
+            if allowed is not None and module not in allowed:
+                continue
             devices.append({
-                "module": int((device / "module_id").read_text()),
+                "module": module,
                 "numa": int((device / "numa_node").read_text()),
                 "bus": device.resolve().name,
-                "node": Path("/dev/accel") / accelerator.name,
+                "node": node,
             })
         except (FileNotFoundError, ValueError):
             continue
     return devices
 
 
-def _device_is_idle(device: dict[str, Any]) -> bool:
-    owner = subprocess.run(["fuser", str(device["node"])], capture_output=True, text=True)
-    if owner.returncode != 1 or owner.stdout.strip() or owner.stderr.strip():
-        return False
+def _read_device_status(device: dict[str, Any]) -> tuple[float, float]:
     status = subprocess.run(
         [
             "hl-smi",
@@ -152,7 +189,23 @@ def _device_is_idle(device: dict[str, Any]) -> bool:
         text=True,
     ).stdout.strip()
     memory_mib, utilization = (float(field.strip()) for field in status.split(","))
-    return memory_mib <= 1024 and utilization == 0
+    return memory_mib, utilization
+
+
+def _device_is_idle(device: dict[str, Any]) -> bool:
+    owner = subprocess.run(["fuser", str(device["node"])], capture_output=True, text=True)
+    if owner.returncode != 1 or owner.stdout.strip() or owner.stderr.strip():
+        return False
+    # Two consecutive samples: a single `hl-smi` read can land in another process's startup or
+    # teardown, where memory briefly reads low while the card is still in use. The flock only
+    # covers other leasing launchers, not a co-tenant that does not take a lease.
+    for attempt in range(2):
+        memory_mib, utilization = _read_device_status(device)
+        if memory_mib > 1024 or utilization != 0:
+            return False
+        if attempt == 0:
+            time.sleep(_IDLE_RECHECK_SECONDS)
+    return True
 
 
 def _try_lease(lock_dir: Path, requested_module: int | None) -> tuple[dict[str, Any], IO[str]] | None:
@@ -352,7 +405,6 @@ def _command(args: argparse.Namespace, model: Path, task_type: str) -> list[str]
         "1",
         "--kv-cache-memory-bytes",
         str(args.kv_cache_memory_bytes),
-        "--enforce-eager",
         "--diffusion-offload-config",
         json.dumps(offload, separators=(",", ":")),
         "--diffusion-attention-backend",
@@ -373,7 +425,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path, help="local ModelScope checkpoint or FL2VA/Ref2VA partition")
     parser.add_argument("--partition", choices=("FL2VA", "Ref2VA"))
-    parser.add_argument("--module", type=int, help="physical module ID; otherwise lease the first idle module")
+    parser.add_argument("--module", type=int,
+                        help="pin to this module id; by default the launcher leases the first "
+                        "idle module this launcher can see (its candidate list is filtered by HABANA_VISIBLE_MODULES; the pin that selects the card is HLS_MODULE_ID)")
     parser.add_argument(
         "--lock-dir",
         type=Path,
@@ -541,6 +595,9 @@ def main() -> int:
         raise ValueError("--vae-tile-batch-size must be positive")
 
     args.lock_dir.mkdir(parents=True, exist_ok=True)
+    visible = sorted(device["module"] for device in _accelerators())
+    if args.module is not None and args.module not in visible:
+        raise SystemExit(f"module {args.module} is not visible to this process; available: {visible}")
     lease = _try_lease(args.lock_dir, args.module)
     while lease is None:
         target = f"module {args.module}" if args.module is not None else "an idle module"

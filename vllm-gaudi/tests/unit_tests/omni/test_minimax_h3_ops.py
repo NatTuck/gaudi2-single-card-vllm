@@ -60,10 +60,16 @@ def test_install_rebinds_transformer_imports():
     from vllm_gaudi.omni.minimax_h3 import install_minimax_h3_patches
 
     install_minimax_h3_patches()
-    from vllm_omni.diffusion.attention.ops import minimax_h3_modulation
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer
+
+    # The helpers moved from ``diffusion.attention.ops.minimax_h3_modulation`` (removed upstream)
+    # to ``diffusion.layers.indexed_modulation``; the hook rebinds whichever module exists.
+    try:
+        from vllm_omni.diffusion.layers import indexed_modulation as modulation_module
+    except ImportError:
+        from vllm_omni.diffusion.attention.ops import minimax_h3_modulation as modulation_module
 
     for name in minimax_h3_ops.__all__:
         implementation = getattr(minimax_h3_ops, name)
-        assert getattr(minimax_h3_modulation, name) is implementation
+        assert getattr(modulation_module, name) is implementation
         assert getattr(minimax_h3_transformer, name) is implementation
