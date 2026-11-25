@@ -55,6 +55,19 @@ export PT_HPU_LAZY_MODE="${PT_HPU_LAZY_MODE:-1}"
 export PT_HPU_AUTOLOAD="${PT_HPU_AUTOLOAD:-1}"
 export H3_RECIPES_DIR="$RECIPES"
 export PT_HPU_RECIPE_CACHE_CONFIG="${PT_HPU_RECIPE_CACHE_CONFIG:-$RECIPES,false,8192,false}"
+# A colon-separated GC_KERNEL_PATH cannot coexist with an enabled disk recipe cache: the bridge's
+# own validation rejects the whole list as "Path is not a regular file" and aborts (exit 134), and
+# the cache key is a constant, so a rebuilt kernel would be served a stale recipe. Inheriting a
+# list here is the likely case (custom TPC kernels export one), so refuse it loudly rather than
+# let it fail later inside the runtime.
+case "$GC_KERNEL_PATH" in
+  *:*)
+    echo "GC_KERNEL_PATH is a colon-separated list ($GC_KERNEL_PATH)." >&2
+    echo "That is incompatible with the enabled disk recipe cache; unset GC_KERNEL_PATH or set" >&2
+    echo "PT_HPU_RECIPE_CACHE_CONFIG='' to disable the cache." >&2
+    exit 2
+    ;;
+esac
 # The Gaudi Python needs the habanalabs library path; PYTHONNOUSERSITE keeps a user-site package
 # from shadowing the venv's (a stale `peft`/`diffusers` in ~/.local silently wins otherwise).
 export PYTHONPATH="${PYTHONPATH:-/usr/lib/habanalabs/}"

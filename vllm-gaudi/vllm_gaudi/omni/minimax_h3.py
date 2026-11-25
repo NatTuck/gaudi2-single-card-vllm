@@ -36,6 +36,8 @@ _LIGHTX2V_REF_OUTPUT_SHORT_EDGE = 544
 # (448x256 / 896x512 / 1344x768) and every rung composites into the same output frame. The initial
 # noise is drawn at the latent shape, so this preserves the frame geometry, not the shot: the same
 # seed yields a different composition at each rung.
+# 256 and 512 are the lower rungs; 768 is the released rung and is the reference the lower rungs
+# are checked against (and delegated to), never taken as a ladder branch itself.
 _H3_LADDER_SHORT_EDGES = (256, 512, 768)
 _H3_LADDER_ASPECT_RATIO = 7.0 / 4.0
 _PATCHED = False
@@ -648,9 +650,12 @@ def _install_h3_resolution_ladder_hook() -> None:
     each rung. Only the binding is replaced: the shared helper keeps its own guard for every other
     caller.
 
-    The stock 768 rung is delegated, not recomputed, so the released canvas keeps coming from the
-    released code path. Installing this hook before or after the Ref2VA canvas hook composes
-    either way, because each defers on the short edges it does not own.
+    A lower rung is only offered when it lands on the *same* aspect ratio as the released 768 rung
+    for the requested ratio. Rounding each edge to 32 is exact at 7:4 (and therefore at 16:9, which
+    the released policy already maps to 7:4), 1:1 and 9:16, but not at 4:3, 3:4 or 21:9 - there the
+    rungs come out as 352x256 / 672x512 / 1024x768, three different frames. Rather than hand back a
+    canvas that will not cut together with the 768 render, those ratios fall through to the shared
+    helper, which rejects the short edge outright.
     """
 
     from vllm_omni.model_executor.models.minimax_h3 import encoder_processing
@@ -661,12 +666,19 @@ def _install_h3_resolution_ladder_hook() -> None:
         edge = int(short_edge)
         if edge in _H3_LADDER_SHORT_EDGES and edge != _H3_BASE_OUTPUT_SHORT_EDGE:
             height, width = _h3_canvas_at_short_edge(aspect_ratio, edge)
+            reference_height, reference_width = original_canvas(aspect_ratio, _H3_BASE_OUTPUT_SHORT_EDGE)
+            # Integer cross-multiplication: exact, and no float tolerance to get wrong.
+            if width * reference_height != reference_width * height:
+                return original_canvas(aspect_ratio, short_edge)
             logger.info_once(
-                "MiniMax H3 resolution ladder: short_edge=%d -> %dx%d (aspect %.4f)",
+                "MiniMax H3 resolution ladder: short_edge=%d -> %dx%d (aspect %.4f, matches the "
+                "released %dx%d frame)",
                 edge,
                 width,
                 height,
-                float(aspect_ratio),
+                width / height,
+                reference_width,
+                reference_height,
             )
             return height, width
         return original_canvas(aspect_ratio, short_edge)
@@ -674,8 +686,39 @@ def _install_h3_resolution_ladder_hook() -> None:
     encoder_processing.resolve_minimax_h3_output_canvas = resolve_output_canvas
     logger.info_once(
         "Enabled MiniMax H3 same-aspect-ratio resolution ladder "
-        "(7:4 at short edges 256/512/768 -> 448x256, 896x512, 1344x768)"
+        "(short edges 256/512 for ratios that are exact on the 32 grid: 448x256, 896x512 at 7:4)"
     )
+
+
+def _install_h3_ref2va_scope_hook() -> None:
+    """Keep ``target.short_edge=544`` to the Ref2VA partition and task.
+
+    ``_install_h3_ref2va_canvas_hook`` rebinds the canvas resolver, which never sees the task, so on
+    its own it would hand the LightX2V Ref2V 544p canvas - qualified only against the Ref2V LoRA - to
+    any task that asked for that edge. Upstream raised for it; this restores the raise at the seam
+    that does know the task, so the canvas hook can stay a pure geometry override.
+    """
+
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import MINIMAX_H3_OUTPUT_SHORT_EDGE
+
+    original_shape = encoder_processing.resolve_minimax_h3_shape
+
+    def resolve_minimax_h3_shape(task: str, sampling: Any, image: Any) -> Any:
+        extra = getattr(sampling, "extra_args", None) or {}
+        target = extra.get("target")
+        target = target if isinstance(target, Mapping) else {}
+        raw = target.get("short_edge", extra.get("short_edge", MINIMAX_H3_OUTPUT_SHORT_EDGE))
+        try:
+            edge = int(raw)
+        except (TypeError, ValueError):
+            # Not an integer: let the shape resolver report its own type error.
+            return original_shape(task, sampling, image)
+        _validate_h3_output_short_edge(str(task), str(task), edge)
+        return original_shape(task, sampling, image)
+
+    encoder_processing.resolve_minimax_h3_shape = resolve_minimax_h3_shape
+    logger.info_once("Enabled MiniMax H3 Ref2VA 544p short-edge scoping")
 
 
 def _parse_ffmpeg_video_encoders(output: str) -> frozenset[str]:
@@ -1480,7 +1523,7 @@ def _install_h3_dit_trace_hook() -> None:
     )
 
 
-def install_minimax_h3_patches() -> None:
+def install_minimax_h3_patches() -> dict[str, str]:
     """Install idempotent H3 hooks at Omni worker startup."""
 
     global _PATCHED
@@ -1565,6 +1608,7 @@ def install_minimax_h3_patches() -> None:
         ("modulation_ops", _install_h3_modulation_ops),
         ("encoder_attention", _install_h3_encoder_attention_hooks),
         ("ref2va_canvas", _install_h3_ref2va_canvas_hook),
+        ("ref2va_scope", _install_h3_ref2va_scope_hook),
         ("resolution_ladder", _install_h3_resolution_ladder_hook),
         ("reference_video_transcode", _install_h3_reference_video_transcode_hook),
         ("fasth3", _install_fasth3_hooks),

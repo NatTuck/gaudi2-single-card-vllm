@@ -20,6 +20,8 @@ import sys
 import time
 from typing import IO, Any
 
+# A second idle sample this far after the first: one hl-smi read can catch a card mid teardown.
+_IDLE_RECHECK_SECONDS = 3.0
 _FLASHGEN_FILENAME = "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
 _FLASHGEN_METADATA = {
     "key_format": "minimax-h3-native",
@@ -131,6 +133,7 @@ def _visible_modules() -> set[int] | None:
     if not raw:
         return None
     modules: set[int] = set()
+    unparsed: list[str] = []
     for field in raw.split(","):
         field = field.strip()
         if not field:
@@ -138,8 +141,15 @@ def _visible_modules() -> set[int] | None:
         try:
             modules.add(int(field))
         except ValueError:
-            continue
-    return modules or None
+            unparsed.append(field)
+    if unparsed:
+        # Fail closed. Treating an unreadable filter as "no filter" would lease a card the operator
+        # meant to exclude, which is the opposite of what HABANA_VISIBLE_MODULES is for.
+        raise SystemExit(
+            "HABANA_VISIBLE_MODULES contains entries this launcher cannot read as module ids: "
+            f"{unparsed} (full value {raw!r}). Use a comma-separated list of ids, e.g. '4,5'."
+        )
+    return modules
 
 
 def _accelerators() -> list[dict[str, Any]]:
@@ -165,10 +175,7 @@ def _accelerators() -> list[dict[str, Any]]:
     return devices
 
 
-def _device_is_idle(device: dict[str, Any]) -> bool:
-    owner = subprocess.run(["fuser", str(device["node"])], capture_output=True, text=True)
-    if owner.returncode != 1 or owner.stdout.strip() or owner.stderr.strip():
-        return False
+def _read_device_status(device: dict[str, Any]) -> tuple[float, float]:
     status = subprocess.run(
         [
             "hl-smi",
@@ -182,7 +189,23 @@ def _device_is_idle(device: dict[str, Any]) -> bool:
         text=True,
     ).stdout.strip()
     memory_mib, utilization = (float(field.strip()) for field in status.split(","))
-    return memory_mib <= 1024 and utilization == 0
+    return memory_mib, utilization
+
+
+def _device_is_idle(device: dict[str, Any]) -> bool:
+    owner = subprocess.run(["fuser", str(device["node"])], capture_output=True, text=True)
+    if owner.returncode != 1 or owner.stdout.strip() or owner.stderr.strip():
+        return False
+    # Two consecutive samples: a single `hl-smi` read can land in another process's startup or
+    # teardown, where memory briefly reads low while the card is still in use. The flock only
+    # covers other leasing launchers, not a co-tenant that does not take a lease.
+    for attempt in range(2):
+        memory_mib, utilization = _read_device_status(device)
+        if memory_mib > 1024 or utilization != 0:
+            return False
+        if attempt == 0:
+            time.sleep(_IDLE_RECHECK_SECONDS)
+    return True
 
 
 def _try_lease(lock_dir: Path, requested_module: int | None) -> tuple[dict[str, Any], IO[str]] | None:
@@ -404,7 +427,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--partition", choices=("FL2VA", "Ref2VA"))
     parser.add_argument("--module", type=int,
                         help="pin to this module id; by default the launcher leases the first "
-                        "idle module visible to this process (HABANA_VISIBLE_MODULES is honoured)")
+                        "idle module this launcher can see (its candidate list is filtered by HABANA_VISIBLE_MODULES; the pin that selects the card is HLS_MODULE_ID)")
     parser.add_argument(
         "--lock-dir",
         type=Path,

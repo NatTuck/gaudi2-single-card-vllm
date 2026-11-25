@@ -35,7 +35,14 @@ _REEXPORTS: tuple[tuple[str, str, str], ...] = (
 
 
 def _install_reexports() -> None:
-    """Re-publish names that vLLM-Omni imports from a package that does not export them."""
+    """Re-publish `vllm.distributed` names if a revision stops exporting them.
+
+    Defensive only: on vLLM 0.32.0 all ten are already attributes of the package (its ``__init__``
+    star-imports ``parallel_state`` / ``communication_op`` / ``utils``, none of which define
+    ``__all__``), so this loop is a no-op today. It is kept because the cost is one ``hasattr`` per
+    name at startup and the failure it would cover - a narrowed package namespace - surfaces as a
+    silent ImportError in a worker rather than at install time.
+    """
 
     import importlib
 

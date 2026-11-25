@@ -67,7 +67,7 @@ Requests use the OpenAI chat endpoint, with the diffusion parameters in `extra_b
 curl -s http://127.0.0.1:8091/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-        "model": "qwen-image-2.1",
+        "model": "/path/to/Qwen-Image-2.1",
         "messages": [{"role": "user", "content": "A red ceramic teapot on a wooden table."}],
         "extra_body": {"height": 1024, "width": 1024, "num_inference_steps": 20, "seed": 42,
                        "true_cfg_scale": 1.0}
@@ -76,11 +76,14 @@ curl -s http://127.0.0.1:8091/v1/chat/completions \
 
 The image comes back as a base64 data URL in `choices[0].message.content[0].image_url.url`.
 
+`model` must be the path the server was launched with: the launcher passes no
+`--served-model-name`, so vLLM serves the path itself and rejects any other name.
+
 ## Measured (1024², BF16, one Gaudi2)
 
 | Configuration | 4 steps | 20 steps |
 | --- | ---: | ---: |
-| regional HPU compile (`--compile`) | **2.80-3.07 s** | **8.13 s** |
+| regional HPU compile (`--compile`) | **2.80-3.08 s** | **8.13 s** |
 
 Boot is about 25 s with the weights in the page cache. The same seed is byte-identical across runs
 and across the two stack revisions (the 4-step and 20-step PNGs hash the same as the earlier
@@ -99,11 +102,11 @@ shipped the Qwen-Image worker separately.
    rotation in FP32 before casting back. CPU parity against the stock complex path:
    `max_abs = 4.8e-7` on the rope and `1.1e-5` for a full 32-block forward in float32; the tests in
    `tests/unit_tests/omni/test_qwen_image_21.py` pin it.
-2. **Import bridges** - [`vllm_gaudi/omni/compat.py`](../../vllm_gaudi/omni/compat.py). vLLM-Omni
-   imports ten `vllm.distributed` names that vLLM 0.32 only defines in
-   `parallel_state`/`communication_op`, the `vllm.v1.kv_hints` module (absent), and `torchaudio`
-   (no build matches the Gaudi torch). Each bridge is a no-op when the name already exists, and only
-   import-time compatibility is provided.
+2. **Import bridges** - [`vllm_gaudi/omni/compat.py`](../../vllm_gaudi/omni/compat.py). On vLLM
+   0.32.0 the ten `vllm.distributed` names are all already exported by the package, so that bridge
+   is defensive rather than load-bearing; the ones that still matter are the `vllm.v1.kv_hints`
+   module and a `torchaudio` stand-in (no build matches the Gaudi torch). Each bridge is a no-op
+   when the name already exists, and only import-time compatibility is provided.
 3. **Regional compile and the SDPA backend** are the repository's existing ones: the 2.1
    transformer declares `_repeated_blocks = ["QwenImage21TransformerBlock"]` and
    `_dit_modules = ["transformer"]`, so `VLLM_GAUDI_OMNI_HPU_COMPILE=1` compiles its 32 blocks and

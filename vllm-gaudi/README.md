@@ -412,7 +412,7 @@ print(json.dumps(get_capabilities(), indent=2, ensure_ascii=False, default=str))
 | **DeepSeek V4.1 DSpark** | 独立 prepared / draft / replay 配置 | 默认关闭 |
 | **MiniMax M3** | 已接入 HPU 模型、视觉语言入口与 `minimax_m3_py` 工具解析器 | 当前 MSA 注意力按 dense causal 路线执行；此处仅列代码集成范围 |
 | **MiniMax H3** | 单张 Gaudi2；T2VA / FL2VA / Ref2VA；分阶段卸载 | 配套 vLLM-Omni；默认 BF16，四次前向须匹配蒸馏适配器 |
-| **Qwen-Image 2.1** | 单张 Gaudi2；文生图 1024²（编辑 / 多参考 / 2K 未验证） | 需 vLLM-Omni `3dc3569` 与实数 RoPE 补丁；见 [Qwen-Image 2.1 专页](docs/features/qwen_image_21.md) |
+| **Qwen-Image 2.1** | 单张 Gaudi2；文生图 1024²（编辑 / 多参考 / 2K 未验证） | 需 vLLM-Omni v0.32.0 与实数 RoPE 补丁；见 [Qwen-Image 2.1 专页](docs/features/qwen_image_21.md) |
 | 通用 HPU 模型 | 由引擎、插件、模型及软件版本共同决定 | 参考[继承的功能范围](https://github.com/1CatAI/1Cat-vLLM-Gaudi/blob/5fa3e08302716d458a82aa7d95d107e201b51d8c/docs/features/supported_features.md) |
 
 MiniMax M3 的模型注册、当前注意力实现与工具解析可分别查看[模型源码](https://github.com/1CatAI/1Cat-vLLM-Gaudi/blob/5fa3e08302716d458a82aa7d95d107e201b51d8c/vllm_gaudi/models/minimax_m3.py)和[解析器](https://github.com/1CatAI/1Cat-vLLM-Gaudi/blob/5fa3e08302716d458a82aa7d95d107e201b51d8c/vllm_gaudi/entrypoints/openai/tool_parsers/minimax_m3.py)。

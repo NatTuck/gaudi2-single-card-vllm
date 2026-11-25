@@ -20,6 +20,10 @@ _IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/he
 _VIDEO_TYPES = {"video/mp4", "video/quicktime"}
 _AUDIO_TYPES = {"audio/wav", "audio/x-wav", "audio/mpeg"}
 _T2VA_RATIOS = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
+# Same-aspect-ratio resolution ladder: the released 768 short edge plus two lower rungs, accepted
+# for any task. The server only honours a lower rung for a ratio that lands exactly on the 32 grid
+# at the same aspect ratio as its 768 canvas (7:4 and 16:9, 1:1, 9:16); the rest are refused there.
+_LADDER_SHORT_EDGES = {256, 512, 768}
 _PINNED_OMNI_REFERENCE_SIGMA_POINTS = 50
 _FLASHGEN_INFERENCE_STEPS = 4
 _FLASHGEN_SIGMA_POINTS = 5
@@ -242,9 +246,16 @@ def _validate(args: argparse.Namespace, references: list[tuple[Path, str]]) -> N
             raise ValueError("Ref2VA requires at least one visual reference")
         if args.audio_url and audios:
             raise ValueError("use either --audio-url or uploaded audio references")
-        expected_short_edge = _lightx2v_profile(Path(lightx2v)).output_short_edge if lightx2v is not None else 768
-        if args.short_edge != expected_short_edge:
-            raise ValueError(f"Ref2VA short_edge must be {expected_short_edge} for the selected profile")
+        if lightx2v is not None:
+            # A selected LoRA was qualified at one canvas; do not move it.
+            expected_short_edge = _lightx2v_profile(Path(lightx2v)).output_short_edge
+            if args.short_edge != expected_short_edge:
+                raise ValueError(f"Ref2VA short_edge must be {expected_short_edge} for the selected profile")
+        elif args.short_edge not in _LADDER_SHORT_EDGES:
+            raise ValueError(
+                f"Ref2VA short_edge must be 768 or a ladder edge {sorted(_LADDER_SHORT_EDGES)}, "
+                f"got {args.short_edge}"
+            )
 
 
 def _request_data(args: argparse.Namespace) -> dict[str, str]:
@@ -299,7 +310,7 @@ def _request_data(args: argparse.Namespace) -> dict[str, str]:
         data.update(width=str(args.width), height=str(args.height))
     if args.task != "fl2va":
         data["aspect_ratio"] = args.aspect_ratio
-    if args.task == "ref2va":
+    if args.short_edge is not None:
         data["short_edge"] = str(args.short_edge)
     if args.audio_url:
         data["audio_reference"] = json.dumps({"audio_url": args.audio_url}, separators=(",", ":"))

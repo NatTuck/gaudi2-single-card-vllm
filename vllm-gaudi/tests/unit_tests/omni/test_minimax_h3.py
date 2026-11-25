@@ -144,6 +144,17 @@ def test_resolution_ladder_canvas_is_the_same_policy_below_the_released_edge():
     assert width * height <= 768 * 1344
 
 
+def test_resolution_ladder_rounding_changes_the_frame_at_three_quarters():
+    """The reason the hook has to check the achieved ratio, not just the short edge.
+
+    4:3 rounds to three different frames on the 32 grid, so the rungs would not cut together.
+    """
+
+    rungs = [_h3_canvas_at_short_edge(4 / 3, edge) for edge in _H3_LADDER_SHORT_EDGES]
+    assert rungs == [(256, 352), (512, 672), (768, 1024)]
+    assert len({width / height for height, width in rungs}) == 3
+
+
 def test_resolution_ladder_canvas_rejects_a_non_positive_request():
     from vllm_omni.errors import OmniClientError
 
@@ -161,11 +172,75 @@ def test_resolution_ladder_patch_accepts_the_lower_rungs_and_keeps_the_released_
     resolve = encoder_processing.resolve_minimax_h3_output_canvas
     assert resolve(_H3_LADDER_ASPECT_RATIO, 256) == (256, 448)
     assert resolve(_H3_LADDER_ASPECT_RATIO, 512) == (512, 896)
+    # 16:9 is the natural way to ask for 7:4: the released policy already maps it there.
+    assert resolve(16 / 9, 256) == (256, 448)
     # The released rung keeps coming from the released code path.
     assert resolve(_H3_LADDER_ASPECT_RATIO, 768) == (768, 1344)
     # Short edges outside the ladder are still refused by the shared helper.
     with pytest.raises(OmniClientError, match="must be 768"):
         preprocessing.resolve_minimax_h3_output_canvas(_H3_LADDER_ASPECT_RATIO, 512)
+
+
+def test_resolution_ladder_only_offers_a_rung_that_keeps_the_frame():
+    """Every rung the hook hands back must share the released 768 rung's aspect ratio."""
+
+    install_minimax_h3_patches()
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing, preprocessing
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+        MINIMAX_H3_SUPPORTED_ASPECT_RATIOS,
+    )
+
+    offered = 0
+    for name, ratio in MINIMAX_H3_SUPPORTED_ASPECT_RATIOS.items():
+        reference_height, reference_width = preprocessing.resolve_minimax_h3_output_canvas(ratio, 768)
+        for edge in (256, 512):
+            try:
+                height, width = encoder_processing.resolve_minimax_h3_output_canvas(ratio, edge)
+            except OmniClientError:
+                continue
+            offered += 1
+            assert width * reference_height == reference_width * height, name
+    assert offered == 6, "expected 16:9, 1:1 and 9:16 to offer both lower rungs"
+
+
+def test_resolution_ladder_refuses_a_ratio_that_does_not_land_exactly():
+    install_minimax_h3_patches()
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing
+
+    resolve = encoder_processing.resolve_minimax_h3_output_canvas
+    for ratio in (4 / 3, 3 / 4, 21 / 9):
+        for edge in (256, 512):
+            with pytest.raises(OmniClientError, match="must be 768"):
+                resolve(ratio, edge)
+
+
+def _fake_sampling(short_edge: object) -> SimpleNamespace:
+    return SimpleNamespace(extra_args={"target": {"short_edge": short_edge}}, fps=24)
+
+
+def test_ref2va_544_canvas_is_scoped_to_the_ref2va_task():
+    """The canvas hook cannot see the task, so the shape hook has to enforce the scoping."""
+
+    install_minimax_h3_patches()
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing
+
+    resolve = encoder_processing.resolve_minimax_h3_shape
+    for task in ("t2va", "fl2va"):
+        with pytest.raises(OmniClientError, match="requires the Ref2VA partition and task"):
+            resolve(task, _fake_sampling(544), None)
+
+
+def test_ref2va_544_canvas_still_works_for_the_ref2va_task():
+    install_minimax_h3_patches()
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing
+
+    # The scope check must not disturb a legitimate Ref2VA request: it has to reach the real shape
+    # resolver and come back with the LightX2V 544p canvas.
+    height, width, *_ = encoder_processing.resolve_minimax_h3_shape("ref2va", _fake_sampling(544), None)
+    assert (height, width) == (544, 960)
 
 
 def test_h3_encoder_fused_sdpa_disallows_implicit_cpu_fallback():

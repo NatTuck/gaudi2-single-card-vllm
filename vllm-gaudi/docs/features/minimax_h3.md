@@ -17,7 +17,7 @@ dependency group; it is not a separately maintained deployment.
 | Transformers | 5.16.1 |
 | Diffusers | 0.40.0 |
 | ModelScope | 1.40.0 |
-| ImageIO FFmpeg | 0.6.0 |
+| imageio / ffmpeg | `imageio[ffmpeg]>=2.37.2` |
 
 Install the multimodal dependencies only where H3 serving is needed:
 
@@ -587,8 +587,8 @@ is visible to the process (`HABANA_VISIBLE_MODULES` is honoured and a card witho
 `/dev/accel` node is not a candidate), and `--module N` is an opt-in pin that fails fast when
 that id is not visible. The `--module 0` examples earlier in this guide record the pinned
 configuration those measurements were taken on.
- On vLLM-Omni v0.32.0 all ten install.
-The H3 unit tests in `tests/unit_tests/omni/` pass (96 passed, 1 skipped for the whole suite).
+ On vLLM-Omni v0.32.0 all twelve install.
+The H3 unit tests in `tests/unit_tests/omni/` pass (130 passed, 1 skipped for the whole suite).
 
 **Not yet exercised end to end:** the vLLM-Omni 0.32 H3 adapter loads the **native**
 checkpoint layout (`auto_map.AutoModel` in each component config), while the snapshot on this host
@@ -637,6 +637,12 @@ A cold run of a shape pays a one-off graph capture: `medium` was 186.4 s cold ag
 so ~50 s of the first request at a new canvas is compilation. `high` fits at 1344x768 with per-block
 graphs — the whole-DiT graph OOMs at capture at that size.
 
+These are harness numbers, not product numbers, and the harness is part of the configuration: lazy
+mode with `PT_HPU_AUTOLOAD=1`, an 8 GB disk recipe cache, `--te-threads 8`, and a warm prompt-embed
+cache, measured through `scripts/launch_h3.sh` on the diffusers-modular port rather than on
+vLLM-Omni. Changing any of those changes the numbers; the recipe cache in particular is what turns a
+cold rung into a warm one.
+
 Where the time goes changes with the rung, which matters for tuning:
 
 - `draft` is **VAE-decode bound**: 8 denoising steps cost well under a second of device time, while
@@ -656,12 +662,19 @@ specific shot.
 Two ways to select a rung:
 
 ```bash
-# vLLM-Omni request: short_edge picks the rung, aspect_ratio stays 1.75 for all three
-python tools/minimax_h3/request_video.py --short-edge 256 --aspect-ratio 1.75 ...
+# vLLM-Omni request: ask for 16:9, then pick the rung with short_edge. The released policy already
+# maps 16:9 onto 7:4, so 16:9 at 768/512/256 is exactly the high/medium/draft ladder.
+python tools/minimax_h3/request_video.py --aspect-ratio 16:9 --short-edge 256 ...
 
 # The port runner: a named bucket carries shape and step count together
 H3_PORT_DIR=/data/h3/hpu_port scripts/launch_h3.sh --prompt "..." --bucket draft
 ```
+
+A lower rung is offered only when it lands on the same aspect ratio as the released 768 rung for the
+requested ratio. Rounding each edge to 32 is exact at 7:4 (and so at 16:9, which maps onto 7:4),
+1:1 and 9:16; at 4:3, 3:4 and 21:9 the rungs come out as three different frames
+(4:3 gives 352x256 / 672x512 / 1024x768), so those ratios are refused rather than handed a canvas
+that will not cut together with the 768 render.
 
 `_install_h3_resolution_ladder_hook()` rebinds only
 `encoder_processing.resolve_minimax_h3_output_canvas`, so `target.short_edge` accepts 256 and 512
@@ -701,5 +714,10 @@ Measured on one Gaudi2, 1280x704 / 124 frames / 8 steps:
 `H3_MAX_GRAPH_SEQ` (20000) under CP=1 with graphs on, because a *whole-DiT* capture's host-side IR
 grows with the sequence (an r768/192f capture ballooned process RSS to 86.6 GB and was OOM-killed).
 Per-block capture bounds the IR by the largest single block, so that premise does not hold in this
-mode; `install()` lifts the cap to 65536 and says so, instead of letting the `medium` and `high`
-rungs be rejected for a reason that no longer applies.
+mode, and `install()` lifts the cap to 65536.
+
+Two things to be precise about. The guard lives in the port's *server* request path
+(`_server_apply_params`), so a single-shot `--bucket` run never evaluates it — the lift is inert
+there and only matters under `H3_SERVER_MODE`. And of the three rungs only `high` is over the
+default cap: `draft` is 5070 and `medium` is 17502 against 20000 at the released text budget of
+512 (6606 / 19038 at `--text-budget 2048`), while `high` is 38222 / 39758.
